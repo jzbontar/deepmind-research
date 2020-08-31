@@ -14,8 +14,8 @@ from byol.utils import networks
 def j2t(x):
     return torch.from_numpy(np.asarray(x).copy()).cuda()
 
-def allclose(jx, tx):
-    return torch.allclose(j2t(jx), tx)
+def allclose(jx, tx, **kwargs):
+    return torch.allclose(j2t(jx), tx, **kwargs)
 
 class TestBYOL(unittest.TestCase):
     def test_linear(self):
@@ -42,16 +42,29 @@ class TestBYOL(unittest.TestCase):
             return hk.BatchNorm(**bn_config)(inputs, is_training=is_training)
         forward = hk.without_apply_rng(hk.transform_with_state(_forward))
         k = random.PRNGKey(0)
-        x = [random.normal(kk, (4, 3)) for kk in random.split(k, 3)]
+        x = [random.normal(kk, (4, 3)) for kk in random.split(k, 4)]
 
         params, state0 = forward.init(k, x[0], True)
         jout1, state1 = forward.apply(params, state0, x[1], True)
-        jout2, state2 = forward.apply(params, state1, x[2], False)
+        jout2, state2 = forward.apply(params, state1, x[2], True)
+        jout3, state3 = forward.apply(params, state2, x[3], False)
 
         m = nn.BatchNorm1d(3).cuda()
+        m.running_var.zero_()
         tout1 = m.forward(j2t(x[1]))
-        tout2 = m.eval().forward(j2t(x[2]))
+        tout2 = m.forward(j2t(x[2]))
+
+        def zero_debias(x, decay, counter):
+            return x / (1 - decay**counter)
+
+        batch_size = 4
+        m.running_mean = zero_debias(m.running_mean, 1 - m.momentum, m.num_batches_tracked)
+        m.running_var = zero_debias(m.running_var * (batch_size - 1) / batch_size, 1 - m.momentum, m.num_batches_tracked)
+        tout3 = m.eval().forward(j2t(x[3]))
 
         assert allclose(jout1, tout1)
         assert allclose(jout2, tout2)
+        assert allclose(jout3, tout3, atol=1e-7)
 
+    def test_mlp(self):
+        pass
