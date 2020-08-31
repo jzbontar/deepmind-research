@@ -3,6 +3,6 @@ dm-haiku
 dm-tree
 jax
 jaxlib
-numpy>=1.16
+numpy
 tensorflow
 tensorflow_datasets

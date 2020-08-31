@@ -15,6 +15,11 @@
 
 """Training and evaluation loops for an experiment."""
 
+import signal
+def signal_handler(sig, frame):
+    exit()
+signal.signal(signal.SIGINT, signal_handler)
+
 import time
 from typing import Any, Mapping, Text, Type, Union
 
