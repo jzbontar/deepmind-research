@@ -21,7 +21,11 @@ def j2t(x, cuda=True):
     return y
 
 def allclose(jx, tx, **kwargs):
-    return torch.allclose(j2t(jx), tx, **kwargs)
+    close = torch.allclose(j2t(jx), tx, **kwargs)
+    if not close:
+        print((j2t(jx) - tx).abs().max())
+    return close
+        
 
 class TestBYOL(unittest.TestCase):
     def test_linear(self):
@@ -99,13 +103,12 @@ class TestBYOL(unittest.TestCase):
         params, state = forward.init(k, x, True)
         jout, _ = forward.apply(params, state, x, True)
 
-        # params, state = pickle.load(open('foo.pkl', 'rb'))
         sd = sd_j2t(convert_resnet(params, state))
         m = byol.jzb_resnet.resnet18().cuda()
         m.load_state_dict(sd)
         tout = m(j2t(x).permute(0, 3, 1, 2))
 
-        print((j2t(jout) - tout).abs().max())
+        assert allclose(jout, tout, atol=1e-3)
 
     def test_conv(self):
         def _forward(inputs, is_training):
