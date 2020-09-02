@@ -1,7 +1,9 @@
 import unittest
+import pickle
 
 import torch
 from torch import nn
+import torchvision
 
 import haiku as hk
 from jax import random
@@ -10,9 +12,13 @@ import jax.numpy as jnp
 import numpy as np
 
 from byol.utils import networks
+import byol.jzb_resnet
 
-def j2t(x):
-    return torch.from_numpy(np.asarray(x).copy()).cuda()
+def j2t(x, cuda=True):
+    y = torch.from_numpy(np.asarray(x).copy())
+    if cuda:
+        y = y.cuda()
+    return y
 
 def allclose(jx, tx, **kwargs):
     return torch.allclose(j2t(jx), tx, **kwargs)
@@ -83,28 +89,85 @@ class TestBYOL(unittest.TestCase):
 
         assert allclose(jout, tout)
 
+    def test_resnet(self):
+        def _forward(inputs, is_training):
+            bn_config = {'decay_rate': 0.9, 'eps': 1e-05, 'create_scale': True, 'create_offset': True}
+            return networks.ResNet18(bn_config=bn_config)(inputs, is_training)
+        forward = hk.without_apply_rng(hk.transform_with_state(_forward))
+        k = random.PRNGKey(0)
+        x = random.normal(k, (4, 32, 32, 3))
+        params, state = forward.init(k, x, True)
+        jout, _ = forward.apply(params, state, x, True)
+
+        # pickle.dump((params, state), open('foo.pkl', 'wb'))
+
+        params, state = pickle.load(open('foo.pkl', 'rb'))
+        sd = sd_j2t(convert_resnet(params, state))
+        m = byol.jzb_resnet.resnet18().cuda()
+        m.load_state_dict(sd)
+        tout = m(j2t(x).permute(0, 3, 1, 2))
+
+        print((j2t(jout) - tout).abs())
+
+def convert_resnet(params, state):
+    n = list(params.keys())[0].split('/')[0] + '/~'
+
+    return dict(
+        **add_prefix('conv1', convert_conv(f'{n}/initial_conv', params)),
+        **add_prefix('bn1', convert_batchnorm(f'{n}/initial_batchnorm', params, state)),
+        **add_prefix('layer1', convert_blockgroup(f'{n}/block_group_0/~', params, state)),
+        **add_prefix('layer2', convert_blockgroup(f'{n}/block_group_1/~', params, state)),
+        **add_prefix('layer3', convert_blockgroup(f'{n}/block_group_2/~', params, state)),
+        **add_prefix('layer4', convert_blockgroup(f'{n}/block_group_3/~', params, state)),
+    )
+
+def convert_blockgroup(prefix, params, state):
+    return dict(
+        **add_prefix('0', convert_block(f'{prefix}/block_0/~', params, state)),
+        **add_prefix('1', convert_block(f'{prefix}/block_1/~', params, state)),
+    )
+
+def convert_block(prefix, params, state):
+    d = dict(
+        **add_prefix('conv1', convert_conv(f'{prefix}/conv_0', params)),
+        **add_prefix('bn1', convert_batchnorm(f'{prefix}/batchnorm_0', params, state)),
+        **add_prefix('conv2', convert_conv(f'{prefix}/conv_1', params)),
+        **add_prefix('bn2', convert_batchnorm(f'{prefix}/batchnorm_1', params, state)),
+    )
+    if prefix.endswith('/block_0/~'):
+        d.update(
+            **add_prefix('downsample.0', convert_conv(f'{prefix}/shortcut_conv', params)),
+            **add_prefix('downsample.1', convert_batchnorm(f'{prefix}/shortcut_batchnorm', params, state)),
+        )
+    return d
+    
+
+def convert_conv(prefix, params):
+    return dict(weight=params[prefix]['w'].transpose(3, 2, 0, 1), bias=params[prefix].get('b'))
+
 def add_prefix(prefix, params):
     return {f'{prefix}.{k}': v for k, v in params.items()}
 
 def sd_j2t(sd):
-    return {k: j2t(v) for k, v in sd.items() if v is not None}
+    return {k: j2t(v, False) for k, v in sd.items() if v is not None}
 
 def convert_mlp(params, state):
     assert len(params.keys()) == 3
     n = list(params.keys())[0].split('/')[0]
     return dict(
-        **add_prefix('0', convert_linear(params[f'{n}/linear'])),
-        **add_prefix('1', convert_batchnorm(
-            params[f'{n}/batch_norm'], 
-            state[f'{n}/batch_norm/~/mean_ema'], 
-            state[f'{n}/batch_norm/~/var_ema'])),
-        **add_prefix('3', convert_linear(params[f'{n}/linear_1'])))
+        **add_prefix('0', convert_linear(f'{n}/linear', params)),
+        **add_prefix('1', convert_batchnorm(f'{n}/batch_norm', params, state)),
+        **add_prefix('3', convert_linear(f'{n}/linear_1', params)))
 
-def convert_batchnorm(params, mean_ema, var_ema):
-    return dict(weight=params['scale'].ravel(), bias=params['offset'].ravel(), running_mean=mean_ema['hidden'].ravel(), running_var=var_ema['hidden'].ravel())
+def convert_batchnorm(prefix, params, state):
+    return dict(
+        weight=params[prefix]['scale'].ravel(), 
+        bias=params[prefix]['offset'].ravel(), 
+        running_mean=state[f'{prefix}/~/mean_ema']['hidden'].ravel(), 
+        running_var=state[f'{prefix}/~/var_ema']['hidden'].ravel())
 
-def convert_linear(params):
-    return dict(weight=params['w'].T, bias=params.get('b'))
+def convert_linear(prefix, params):
+    return dict(weight=params[prefix]['w'].T, bias=params[prefix].get('b'))
 
 def MLP(input_size, hidden_size, output_size):
     return nn.Sequential(
@@ -112,3 +175,4 @@ def MLP(input_size, hidden_size, output_size):
         nn.BatchNorm1d(hidden_size),
         nn.ReLU(),
         nn.Linear(hidden_size, output_size, bias=False))
+
