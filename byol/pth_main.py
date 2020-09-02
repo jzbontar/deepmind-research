@@ -143,6 +143,24 @@ class TestBYOL(unittest.TestCase):
 
         print((j2t(jout) - tout).abs())
 
+    def test_block(self):
+        def _forward(inputs, is_training):
+            bn_config = {'decay_rate': 0.9, 'eps': 1e-05, 'create_scale': True, 'create_offset': True}
+            resnet = networks.ResNet18(bn_config=bn_config)
+            m = resnet.block_groups[3].blocks[1]
+            return m(inputs, is_training, False)
+        forward = hk.without_apply_rng(hk.transform_with_state(_forward))
+        k = random.PRNGKey(0)
+        x = random.normal(k, (2, 7, 7, 512))
+        params, state = forward.init(k, x, True)
+        jout, _ = forward.apply(params, state, x, True)
+
+        resnet = byol.jzb_resnet.resnet18().cuda()
+        m = resnet.layer4[1]
+        m.load_state_dict(sd_j2t(convert_block('res_net18/~/block_group_3/~/block_1/~', params, state)))
+        tout = m(j2t(x).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+
+        assert allclose(jout, tout, atol=1e-5)
 
 def convert_resnet(params, state):
     n = list(params.keys())[0].split('/')[0] + '/~'
