@@ -160,6 +160,24 @@ class TestBYOL(unittest.TestCase):
 
         assert allclose(jout, tout, atol=1e-5)
 
+    def test_maxpool(self):
+        def _forward(inputs):
+            return hk.max_pool(inputs, window_shape=(1, 3, 3, 1), strides=(1, 2, 2, 1), padding='SAME')
+        forward = hk.without_apply_rng(hk.transform_with_state(_forward))
+        k = random.PRNGKey(0)
+        x = random.normal(k, (2, 112, 112, 64))
+        params, state = forward.init(k, x)
+        jout, _ = forward.apply(params, state, x)
+        
+        m = nn.Sequential(
+            nn.ConstantPad2d((0, 1, 0, 1), -2e38),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=0),
+        )
+        tout = m(j2t(x).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+
+        assert allclose(jout, tout, atol=1e-5)
+
+
 def convert_resnet(params, state):
     n = list(params.keys())[0].split('/')[0] + '/~'
 
