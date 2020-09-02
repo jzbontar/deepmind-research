@@ -99,15 +99,13 @@ class TestBYOL(unittest.TestCase):
         params, state = forward.init(k, x, True)
         jout, _ = forward.apply(params, state, x, True)
 
-        # pickle.dump((params, state), open('foo.pkl', 'wb'))
-
-        params, state = pickle.load(open('foo.pkl', 'rb'))
+        # params, state = pickle.load(open('foo.pkl', 'rb'))
         sd = sd_j2t(convert_resnet(params, state))
         m = byol.jzb_resnet.resnet18().cuda()
         m.load_state_dict(sd)
         tout = m(j2t(x).permute(0, 3, 1, 2))
 
-        print((j2t(jout) - tout).abs())
+        print((j2t(jout) - tout).abs().max())
 
     def test_conv(self):
         def _forward(inputs, is_training):
@@ -141,23 +139,23 @@ class TestBYOL(unittest.TestCase):
         m.load_state_dict(sd_j2t(convert_blockgroup('res_net18/~/block_group_3/~', params, state)))
         tout = m(j2t(x).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
 
-        print((j2t(jout) - tout).abs())
+        assert allclose(jout, tout, atol=1e-5)
 
     def test_block(self):
         def _forward(inputs, is_training):
             bn_config = {'decay_rate': 0.9, 'eps': 1e-05, 'create_scale': True, 'create_offset': True}
             resnet = networks.ResNet18(bn_config=bn_config)
-            m = resnet.block_groups[3].blocks[1]
+            m = resnet.block_groups[3].blocks[0]
             return m(inputs, is_training, False)
         forward = hk.without_apply_rng(hk.transform_with_state(_forward))
         k = random.PRNGKey(0)
-        x = random.normal(k, (2, 7, 7, 512))
+        x = random.normal(k, (2, 14, 14, 256))
         params, state = forward.init(k, x, True)
         jout, _ = forward.apply(params, state, x, True)
 
         resnet = byol.jzb_resnet.resnet18().cuda()
-        m = resnet.layer4[1]
-        m.load_state_dict(sd_j2t(convert_block('res_net18/~/block_group_3/~/block_1/~', params, state)))
+        m = resnet.layer4[0]
+        m.load_state_dict(sd_j2t(convert_block('res_net18/~/block_group_3/~/block_0/~', params, state)))
         tout = m(j2t(x).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
 
         assert allclose(jout, tout, atol=1e-5)
