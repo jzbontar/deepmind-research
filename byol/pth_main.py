@@ -109,6 +109,21 @@ class TestBYOL(unittest.TestCase):
 
         print((j2t(jout) - tout).abs())
 
+    def test_conv(self):
+        def _forward(inputs, is_training):
+            return hk.Conv2D(output_channels=8, kernel_shape=3, stride=1, with_bias=False, padding='SAME', name='conv')(inputs)
+        forward = hk.without_apply_rng(hk.transform_with_state(_forward))
+        k = random.PRNGKey(0)
+        x = random.normal(k, (5, 32, 32, 3))
+        params, state = forward.init(k, x, True)
+        jout, _ = forward.apply(params, state, x, True)
+
+        m = nn.Conv2d(3, 8, 3, 1, 1, bias=False).cuda()
+        m.load_state_dict(sd_j2t(convert_conv('conv', params)))
+        tout = m(j2t(x).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+
+        assert allclose(jout, tout, atol=1e-5)
+
 def convert_resnet(params, state):
     n = list(params.keys())[0].split('/')[0] + '/~'
 
@@ -141,9 +156,8 @@ def convert_block(prefix, params, state):
         )
     return d
     
-
 def convert_conv(prefix, params):
-    return dict(weight=params[prefix]['w'].transpose(3, 2, 0, 1), bias=params[prefix].get('b'))
+    return dict(weight=params[prefix]['w'].transpose((3, 2, 0, 1)), bias=params[prefix].get('b'))
 
 def add_prefix(prefix, params):
     return {f'{prefix}.{k}': v for k, v in params.items()}
