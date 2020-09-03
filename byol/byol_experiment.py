@@ -435,6 +435,7 @@ class ByolExperiment:
 
       # initialize Byol and setup optimizer state
       inputs = next(self._train_input)
+      print(inputs['labels'])
       init_byol = jax.pmap(self._make_initial_state, axis_name='i')
 
       # Init uses the same RNG key on all hosts+devices to ensure everyone

@@ -14,10 +14,10 @@ import numpy as np
 from byol.utils import networks
 import byol.jzb_resnet
 
-def j2t(x, cuda=True):
-    y = torch.from_numpy(np.asarray(x).copy())
-    if cuda:
-        y = y.cuda()
+def j2t(x):
+    y = torch.from_numpy(np.asarray(x).copy()).cuda()
+    if y.ndim == 4:
+        y = y.permute(0, 3, 1, 2)
     return y
 
 def allclose(jx, tx, **kwargs):
@@ -86,12 +86,12 @@ class TestBYOL(unittest.TestCase):
         params, state = forward.init(k, x, True)
         jout, _ = forward.apply(params, state, x, True)
 
-        sd = sd_j2t(convert_mlp(params, state))
+        sd = sd_j2t(convert_mlp('predictor', params, state))
         m = MLP(3, 8, 4).cuda()
         m.load_state_dict(sd)
         tout = m(j2t(x))
 
-        assert allclose(jout, tout)
+        assert allclose(jout, tout, atol=1e-7)
 
     def test_resnet(self):
         def _forward(inputs, is_training):
@@ -103,10 +103,10 @@ class TestBYOL(unittest.TestCase):
         params, state = forward.init(k, x, True)
         jout, _ = forward.apply(params, state, x, True)
 
-        sd = sd_j2t(convert_resnet(params, state))
+        sd = sd_j2t(convert_resnet('res_net18/~', params, state))
         m = byol.jzb_resnet.resnet18().cuda()
         m.load_state_dict(sd)
-        tout = m(j2t(x).permute(0, 3, 1, 2))
+        tout = m(j2t(x))
 
         assert allclose(jout, tout, atol=1e-3)
 
@@ -121,7 +121,7 @@ class TestBYOL(unittest.TestCase):
 
         m = nn.Conv2d(3, 8, 3, 1, 1, bias=False).cuda()
         m.load_state_dict(sd_j2t(convert_conv('conv', params)))
-        tout = m(j2t(x).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        tout = m(j2t(x))
 
         assert allclose(jout, tout, atol=1e-5)
 
@@ -140,7 +140,7 @@ class TestBYOL(unittest.TestCase):
         resnet = byol.jzb_resnet.resnet18().cuda()
         m = resnet.layer4
         m.load_state_dict(sd_j2t(convert_blockgroup('res_net18/~/block_group_3/~', params, state)))
-        tout = m(j2t(x).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        tout = m(j2t(x))
 
         assert allclose(jout, tout, atol=1e-5)
 
@@ -159,7 +159,7 @@ class TestBYOL(unittest.TestCase):
         resnet = byol.jzb_resnet.resnet18().cuda()
         m = resnet.layer4[0]
         m.load_state_dict(sd_j2t(convert_block('res_net18/~/block_group_3/~/block_0/~', params, state)))
-        tout = m(j2t(x).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        tout = m(j2t(x))
 
         assert allclose(jout, tout, atol=1e-5)
 
@@ -180,17 +180,83 @@ class TestBYOL(unittest.TestCase):
 
         assert allclose(jout, tout, atol=1e-5)
 
+    def test_byol_forward(self):
+        import byol.byol_experiment
 
-def convert_resnet(params, state):
-    n = list(params.keys())[0].split('/')[0] + '/~'
+        k0, k1, k2, k3 = random.split(random.PRNGKey(0), 4)
+        input = dict(
+            view1=random.normal(k1, (2, 128, 128, 3)),
+            view2=random.normal(k2, (2, 128, 128, 3)),
+            labels=random.randint(k3, (2,), 0, 9))
 
+        kwargs = {'random_seed': 0, 'num_classes': 10, 'batch_size': 256, 'max_steps': 36988, 'enable_double_transpose': True, 'base_target_ema': 0.996, 'network_config': {'projector_hidden_size': 4096, 'projector_output_size': 256, 'predictor_hidden_size': 4096, 'encoder_class': 'ResNet18', 'encoder_config': {'resnet_v2': False, 'width_multiplier': 1}, 'bn_config': {'decay_rate': 0.9, 'eps': 1e-05, 'create_scale': True, 'create_offset': True}}, 'optimizer_config': {'weight_decay': 1e-06, 'eta': 0.001, 'momentum': 0.9}, 'lr_schedule_config': {'base_learning_rate': 2.0, 'warmup_steps': 369}, 'evaluation_config': {'subset': 'test', 'batch_size': 25}, 'checkpointing_config': {'use_checkpointing': True, 'checkpoint_dir': '/scratch/jzb/byol_checkpoints', 'save_checkpoint_interval': 300, 'filename': 'pretrain.pkl'}}
+        exp = byol.byol_experiment.ByolExperiment(**kwargs)
+        params, state = exp.forward.init(k0, input, is_training=True)
+        jout, _ = exp.forward.apply(params, state, input, is_training=True)
+        
+        m = ByolModel(10, 512, 4096, 256, 4096).cuda()
+        sd = sd_j2t(dict(
+            **add_prefix('classifier', convert_linear('classifier', params)),
+            **add_prefix('predictor', convert_mlp('predictor', params, state)),
+            **add_prefix('projector', convert_mlp('projector', params, state)),
+            **add_prefix('net', convert_resnet('res_net18/~', params, state)),
+        ))
+        m.load_state_dict(sd)
+        tout = m({k: j2t(v) for k, v in input.items()})
+
+        assert jout.keys() == tout.keys()
+        for k in jout.keys():
+            assert allclose(jout[k], tout[k], atol=2e-3)
+
+
+def normalize_images(images):
+    """Normalize the image using ImageNet statistics."""
+    mean_rgb = (0.485, 0.456, 0.406)
+    stddev_rgb = (0.229, 0.224, 0.225)
+    normed_images = images - torch.Tensor(mean_rgb).view(1, 3, 1, 1).cuda()
+    normed_images = normed_images / torch.Tensor(stddev_rgb).view(1, 3, 1, 1).cuda()
+    return normed_images
+
+class ByolModel(nn.Module):
+    def __init__(self, num_classes, projector_input_size, projector_hidden_size, projector_output_size, predictor_hidden_size):
+        super().__init__()
+        self.projector = MLP(projector_input_size, projector_hidden_size, projector_output_size)
+        self.predictor = MLP(projector_output_size, predictor_hidden_size, projector_output_size)
+        self.classifier = nn.Linear(projector_input_size, num_classes)
+        self.net = byol.jzb_resnet.resnet18()
+
+    def forward(self, inputs):
+        def apply_once_fn(images, suffix):
+            images = normalize_images(images)
+
+            embedding = self.net(images)
+            proj_out = self.projector(embedding)
+            pred_out = self.predictor(proj_out)
+
+            # Note the stop_gradient: label information is not leaked into the
+            # main network.
+            classif_out = self.classifier(embedding.detach())
+            outputs = {}
+            outputs['projection' + suffix] = proj_out
+            outputs['prediction' + suffix] = pred_out
+            outputs['logits' + suffix] = classif_out
+            return outputs
+
+        if self.training:
+            outputs_view1 = apply_once_fn(inputs['view1'], '_view1')
+            outputs_view2 = apply_once_fn(inputs['view2'], '_view2')
+            return {**outputs_view1, **outputs_view2}
+        else:
+            return apply_once_fn(inputs['images'], '')
+
+def convert_resnet(prefix, params, state):
     return dict(
-        **add_prefix('conv1', convert_conv(f'{n}/initial_conv', params)),
-        **add_prefix('bn1', convert_batchnorm(f'{n}/initial_batchnorm', params, state)),
-        **add_prefix('layer1', convert_blockgroup(f'{n}/block_group_0/~', params, state)),
-        **add_prefix('layer2', convert_blockgroup(f'{n}/block_group_1/~', params, state)),
-        **add_prefix('layer3', convert_blockgroup(f'{n}/block_group_2/~', params, state)),
-        **add_prefix('layer4', convert_blockgroup(f'{n}/block_group_3/~', params, state)),
+        **add_prefix('conv1', convert_conv(f'{prefix}/initial_conv', params)),
+        **add_prefix('bn1', convert_batchnorm(f'{prefix}/initial_batchnorm', params, state)),
+        **add_prefix('layer1', convert_blockgroup(f'{prefix}/block_group_0/~', params, state)),
+        **add_prefix('layer2', convert_blockgroup(f'{prefix}/block_group_1/~', params, state)),
+        **add_prefix('layer3', convert_blockgroup(f'{prefix}/block_group_2/~', params, state)),
+        **add_prefix('layer4', convert_blockgroup(f'{prefix}/block_group_3/~', params, state)),
     )
 
 def convert_blockgroup(prefix, params, state):
@@ -220,15 +286,13 @@ def add_prefix(prefix, params):
     return {f'{prefix}.{k}': v for k, v in params.items()}
 
 def sd_j2t(sd):
-    return {k: j2t(v, False) for k, v in sd.items() if v is not None}
+    return {k: torch.from_numpy(np.asarray(v).copy()) for k, v in sd.items() if v is not None}
 
-def convert_mlp(params, state):
-    assert len(params.keys()) == 3
-    n = list(params.keys())[0].split('/')[0]
+def convert_mlp(prefix, params, state):
     return dict(
-        **add_prefix('0', convert_linear(f'{n}/linear', params)),
-        **add_prefix('1', convert_batchnorm(f'{n}/batch_norm', params, state)),
-        **add_prefix('3', convert_linear(f'{n}/linear_1', params)))
+        **add_prefix('0', convert_linear(f'{prefix}/linear', params)),
+        **add_prefix('1', convert_batchnorm(f'{prefix}/batch_norm', params, state)),
+        **add_prefix('3', convert_linear(f'{prefix}/linear_1', params)))
 
 def convert_batchnorm(prefix, params, state):
     return dict(
