@@ -2,6 +2,7 @@ import unittest
 import pickle
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 import torchvision
 
@@ -11,13 +12,19 @@ import jax.numpy as jnp
 
 import numpy as np
 
+from byol.utils import augmentations
 from byol.utils import networks
+from byol.utils import dataset
+import byol.byol_experiment
 import byol.jzb_resnet
 
 def j2t(x):
-    y = torch.from_numpy(np.asarray(x).copy()).cuda()
+    y = torch.from_numpy(np.asarray(x).copy())
+    if y.dtype == torch.int32:
+        y = y.long()
     if y.ndim == 4:
         y = y.permute(0, 3, 1, 2)
+    y = y.cuda()
     return y
 
 def allclose(jx, tx, **kwargs):
@@ -176,13 +183,11 @@ class TestBYOL(unittest.TestCase):
             nn.ConstantPad2d((0, 1, 0, 1), -2e38),
             nn.MaxPool2d(kernel_size=3, stride=2, padding=0),
         )
-        tout = m(j2t(x).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        tout = m(j2t(x))
 
         assert allclose(jout, tout, atol=1e-5)
 
     def test_byol_forward(self):
-        import byol.byol_experiment
-
         k0, k1, k2, k3 = random.split(random.PRNGKey(0), 4)
         input = dict(
             view1=random.normal(k1, (2, 128, 128, 3)),
@@ -194,21 +199,52 @@ class TestBYOL(unittest.TestCase):
         params, state = exp.forward.init(k0, input, is_training=True)
         jout, _ = exp.forward.apply(params, state, input, is_training=True)
         
-        m = ByolModel(10, 512, 4096, 256, 4096).cuda()
-        sd = sd_j2t(dict(
-            **add_prefix('classifier', convert_linear('classifier', params)),
-            **add_prefix('predictor', convert_mlp('predictor', params, state)),
-            **add_prefix('projector', convert_mlp('projector', params, state)),
-            **add_prefix('net', convert_resnet('res_net18/~', params, state)),
-        ))
+        m = ByolNetwork().cuda()
+        sd = sd_j2t(convert_byol_network(params, state))
         m.load_state_dict(sd)
         tout = m({k: j2t(v) for k, v in input.items()})
 
         assert jout.keys() == tout.keys()
         for k in jout.keys():
             assert allclose(jout[k], tout[k], atol=2e-3)
+    
+    def test_loss_fn(self):
+        k0, k1, k2, k3 = random.split(random.PRNGKey(0), 4)
+        batch_size = 4
+        input = dict(
+            view1=random.normal(k1, (batch_size, 128, 128, 3)),
+            view2=random.normal(k2, (batch_size, 128, 128, 3)),
+            labels=random.randint(k3, (batch_size,), 0, 9))
+
+        kwargs = {'random_seed': 0, 'num_classes': 10, 'batch_size': batch_size, 'max_steps': 36988, 'enable_double_transpose': True, 'base_target_ema': 0.996, 'network_config': {'projector_hidden_size': 4096, 'projector_output_size': 256, 'predictor_hidden_size': 4096, 'encoder_class': 'ResNet18', 'encoder_config': {'resnet_v2': False, 'width_multiplier': 1}, 'bn_config': {'decay_rate': 0.9, 'eps': 1e-05, 'create_scale': True, 'create_offset': True}}, 'optimizer_config': {'weight_decay': 1e-06, 'eta': 0.001, 'momentum': 0.9}, 'lr_schedule_config': {'base_learning_rate': 2.0, 'warmup_steps': 369}, 'evaluation_config': {'subset': 'test', 'batch_size': 25}, 'checkpointing_config': {'use_checkpointing': True, 'checkpoint_dir': '/scratch/jzb/byol_checkpoints', 'save_checkpoint_interval': 300, 'filename': 'pretrain.pkl'}}
+        exp = byol.byol_experiment.ByolExperiment(**kwargs)
+        state = exp._make_initial_state(k0, input)
+        jout = exp.loss_fn(rng=k0, inputs=input, 
+            online_params=state.online_params, 
+            online_state=state.online_state, 
+            target_params=state.target_params, 
+            target_state=state.target_state)
+
+        m = ByolModule().cuda()
+        sd = sd_j2t(convert_byol_module(state))
+        m.load_state_dict(sd)
+        tout = m(input, k0)
+
+        jout = jout[1][1]
+        tout = tout[1]
+
+        assert jout.keys() == tout.keys()
+        for k in jout.keys():
+            assert allclose(jout[k], tout[k])
 
 
+
+def convert_byol_module(state):
+    return dict(
+        **add_prefix('online', convert_byol_network(state.online_params, state.online_state)),
+        **add_prefix('target', convert_byol_network(state.target_params, state.target_state)),
+    )
+    
 def normalize_images(images):
     """Normalize the image using ImageNet statistics."""
     mean_rgb = (0.485, 0.456, 0.406)
@@ -217,8 +253,74 @@ def normalize_images(images):
     normed_images = normed_images / torch.Tensor(stddev_rgb).view(1, 3, 1, 1).cuda()
     return normed_images
 
-class ByolModel(nn.Module):
-    def __init__(self, num_classes, projector_input_size, projector_hidden_size, projector_output_size, predictor_hidden_size):
+def regression_loss(x, y):
+    normed_x, normed_y = F.normalize(x, dim=1), F.normalize(y, dim=1)
+    return torch.sum((normed_x - normed_y).pow(2), dim=1)
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(1 / batch_size))
+        return res
+
+class ByolModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.online = ByolNetwork()
+        self.target = ByolNetwork()
+
+    def forward(self, inputs, rng):
+        inputs = augmentations.postprocess(inputs, rng)
+        inputs = {k: j2t(v) for k, v in inputs.items()}
+        labels = inputs['labels']
+
+        online_network_out = self.online(inputs)
+        target_network_out = self.target(inputs)
+
+        # Representation loss
+
+        repr_loss = regression_loss(
+            online_network_out['prediction_view1'],
+            target_network_out['projection_view2'].detach())
+
+        repr_loss = repr_loss + regression_loss(
+            online_network_out['prediction_view2'],
+            target_network_out['projection_view1'].detach())
+
+        repr_loss = torch.mean(repr_loss)
+
+        # Classification loss (with gradient flows stopped from flowing into the
+        # ResNet). This is used to provide an evaluation of the representation
+        # quality during training.
+
+        classif_loss = F.cross_entropy(online_network_out['logits_view1'], labels)
+
+        acc1, acc5 = accuracy(online_network_out['logits_view1'], labels, topk=(1, 5))
+
+        loss = repr_loss + classif_loss
+        logs = dict(
+            loss=loss,
+            repr_loss=repr_loss,
+            classif_loss=classif_loss,
+            top1_accuracy=acc1,
+            top5_accuracy=acc5,
+        )
+
+        return loss, logs
+
+
+class ByolNetwork(nn.Module):
+    def __init__(self, num_classes=10, projector_input_size=512, projector_hidden_size=4096, projector_output_size=256, predictor_hidden_size=4096):
         super().__init__()
         self.projector = MLP(projector_input_size, projector_hidden_size, projector_output_size)
         self.predictor = MLP(projector_output_size, predictor_hidden_size, projector_output_size)
@@ -248,6 +350,14 @@ class ByolModel(nn.Module):
             return {**outputs_view1, **outputs_view2}
         else:
             return apply_once_fn(inputs['images'], '')
+
+def convert_byol_network(params, state):
+    return dict(
+        **add_prefix('classifier', convert_linear('classifier', params)),
+        **add_prefix('predictor', convert_mlp('predictor', params, state)),
+        **add_prefix('projector', convert_mlp('projector', params, state)),
+        **add_prefix('net', convert_resnet('res_net18/~', params, state)),
+    )
 
 def convert_resnet(prefix, params, state):
     return dict(
