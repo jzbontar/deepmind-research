@@ -9,6 +9,7 @@ import torchvision
 import haiku as hk
 from jax import random
 import jax.numpy as jnp
+import optax
 
 import numpy as np
 
@@ -237,6 +238,40 @@ class TestBYOL(unittest.TestCase):
         for k in jout.keys():
             assert allclose(jout[k], tout[k])
 
+    def test_scale(self):
+        k = random.split(random.PRNGKey(0), 2)
+        params = [random.normal(k[0], (4,))]
+        grads = [random.normal(k[1], (4,))]
+
+        t = optax.scale(2)
+        state = t.init(params)
+        jgrads, state = t.update(grads, state, params)
+
+        tparams = []
+        for p, g in zip(params, grads):
+            tparam = j2t(p)
+            tparam.grad = j2t(g)
+            tparams.append(tparam)
+
+        t = Scale(2)
+        t.init(tparams)
+        t.update()
+        tgrads = [p.grad for p in tparams]
+
+        assert allclose(jgrads[0], tgrads[0])
+
+        
+
+class Scale:
+    def __init__(self, scale_coeff):
+        self.scale_coeff = scale_coeff
+
+    def init(self, params):
+        self.params = params
+
+    def update(self):
+        for p in self.params:
+            p.grad.mul_(self.scale_coeff)
 
 
 def convert_byol_module(state):
