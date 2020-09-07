@@ -117,8 +117,11 @@ class TestBYOL(unittest.TestCase):
         m = byol.jzb_resnet.resnet18().cuda()
         m.load_state_dict(sd)
         tout = m(j2p_tensor(x))
-
         assert allclose(jout, tout, atol=1e-3)
+
+        params1, state1 = p2j_resnet(m, 'res_net18/~', [2, 2, 2, 2])
+        jout1, _ = forward.apply(params1, state1, x, True)
+        assert allclose(jout, j2p_tensor(jout1))
 
     def test_conv(self):
         def _forward(inputs, is_training):
@@ -155,8 +158,12 @@ class TestBYOL(unittest.TestCase):
         m = resnet.layer4
         m.load_state_dict(j2p_sd(j2p_blockgroup('res_net18/~/block_group_3/~', params, state)))
         tout = m(j2p_tensor(x))
-
         assert allclose(jout, tout, atol=1e-5)
+
+        params1, state1 = p2j_blockgroup(m, 'res_net18/~/block_group_3/~', num_blocks=2)
+        jout1, _ = forward.apply(params1, state1, x, True)
+        assert allclose(jout, j2p_tensor(jout1))
+
 
     def test_block(self):
         def _forward(inputs, is_training):
@@ -279,7 +286,7 @@ def j2p_batchnorm(prefix, params, state):
         running_var=state[f'{prefix}/~/var_ema']['hidden'].ravel(),
         num_batches_tracked=0)
 
-def p2j_batchnorm(m, prefix, ndim=2):
+def p2j_batchnorm(m, prefix, batch_size=4, ndim=2):
     if ndim == 2:
         w = m.weight[None]
         b = m.bias[None]
@@ -294,22 +301,12 @@ def p2j_batchnorm(m, prefix, ndim=2):
             average=p2j_tensor(x / (1 - 0.9**m.num_batches_tracked)))
     state = {
         f'{prefix}/~/mean_ema': ema(m.running_mean),
-        f'{prefix}/~/var_ema': ema(3 / 4 * m.running_var),
+        f'{prefix}/~/var_ema': ema((batch_size - 1) / batch_size * m.running_var),
     }
     return params, state
 
 def p2j_tensor(x):
     return jnp.array(x.detach().cpu().numpy())
-
-def p2j_byol_module(m):
-    return dict(target=p2j_byol_network(root.target), online=p2j_byol_network(root.online))
-
-def p2j_byol_network(m):
-    return dict(
-        **p2j_mlp(root.projector, f'{prefix}projector/'),
-        **p2j_mlp(root.predictor, f'{prefix}predictor/'),
-        **p2j_linear(root.classifier, f'{prefix}classifier/'),
-        **p2j_resnet(root.net, f'{prefix}res_net18/~/'))
 
 def p2j_linear(m, prefix):
     params = dict(w=p2j_tensor(m.weight.T))
@@ -325,9 +322,6 @@ def p2j_mlp(m, prefix):
         **p2j_linear(m[3], f'{prefix}/linear_1')}
     return params, bn_state
 
-def p2j_resnet(m, prefix):
-    return {}
-        
 class AddWeightDecay:
     def __init__(self, weight_decay):
         self.weight_decay = weight_decay
@@ -483,11 +477,30 @@ def j2p_resnet(prefix, params, state):
         **add_prefix('layer4', j2p_blockgroup(f'{prefix}/block_group_3/~', params, state)),
     )
 
+def p2j_resnet(m, prefix, num_blocks):
+    c1_params = p2j_conv(m.conv1, f'{prefix}/initial_conv')
+    bn1_params, bn1_state = p2j_batchnorm(m.bn1, f'{prefix}/initial_batchnorm', ndim=4)
+    p1, s1 = p2j_blockgroup(m.layer1, f'{prefix}/block_group_0/~', num_blocks[0])
+    p2, s2 = p2j_blockgroup(m.layer2, f'{prefix}/block_group_1/~', num_blocks[1])
+    p3, s3 = p2j_blockgroup(m.layer3, f'{prefix}/block_group_2/~', num_blocks[2])
+    p4, s4 = p2j_blockgroup(m.layer4, f'{prefix}/block_group_3/~', num_blocks[3])
+    params = {**c1_params, **bn1_params, **p1, **p2, **p3, **p4}
+    state = {**bn1_state, **s1, **s2, **s3, **s4}
+    return params, state
+
 def j2p_blockgroup(prefix, params, state):
     return dict(
         **add_prefix('0', j2p_block(f'{prefix}/block_0/~', params, state)),
         **add_prefix('1', j2p_block(f'{prefix}/block_1/~', params, state)),
     )
+
+def p2j_blockgroup(m, prefix, num_blocks):
+    params, state = {}, {}
+    for i in range(num_blocks):
+        p, s = p2j_block(m[i], f'{prefix}/block_{i}/~')
+        params.update(**p)
+        state.update(**s)
+    return params, state
 
 def j2p_block(prefix, params, state):
     d = dict(
@@ -510,7 +523,7 @@ def p2j_block(m, prefix):
     c2_params = p2j_conv(m.conv2, f'{prefix}/conv_1')
     params = dict(**bn1_params, **bn2_params, **c1_params, **c2_params)
     state = dict(**bn1_state, **bn2_state)
-    if hasattr(m, 'downsample'):
+    if m.downsample is not None:
         bn_params, bn_state = p2j_batchnorm(m.downsample[1], f'{prefix}/shortcut_batchnorm', ndim=4)
         c_params = p2j_conv(m.downsample[0], f'{prefix}/shortcut_conv')
         params.update(**bn_params, **c_params)
