@@ -274,6 +274,11 @@ class TestBYOL(unittest.TestCase):
             jout, _ = forward.apply(params, state, inputs)
             return jnp.mean(jout)
 
+        def torch_grad():
+            loss = m(j2p_tensor(inputs)).mean()
+            m.zero_grad()
+            loss.backward()
+
         forward = hk.without_apply_rng(hk.transform_with_state(_forward))
         k = random.PRNGKey(0)
         inputs = random.normal(k, (2, 3))
@@ -283,10 +288,9 @@ class TestBYOL(unittest.TestCase):
 
         m = nn.Linear(3, 4).cuda()
         m.load_state_dict(j2p_sd(j2p_linear('linear', params)))
-        loss = m(j2p_tensor(inputs)).mean()
-        loss.backward()
+        torch_grad()
 
-        return params, state, grad, m
+        return params, state, grad, m, torch_grad
 
     def test_grad_linear(self):
         grad, m = self.grad_linear()
@@ -295,50 +299,74 @@ class TestBYOL(unittest.TestCase):
         assert allclose(grad['linear']['w'], grad1['linear']['w'])
         assert allclose(grad['linear']['b'], grad1['linear']['b'])
 
-    def helper_test_gradient_transform(self, jt, pt):
-        params, state, grads, m = self.grad_linear()
-
-        state = jt.init(params)
-        jgrads, state = jt.update(grads, state, params)
-
-        pt.init(m.parameters())
-        pt.update()
-        tgrads = p2j_linear(m, 'linear', grad=True)
-
-        assert allclose(jgrads, tgrads)
-
     def test_scale(self):
         self.helper_test_gradient_transform(optax.scale(2), Scale(2))
 
-    def test_weight_decay(self):
+    def test_add_weight_decay(self):
         jt = optimizers.add_weight_decay(0.1, filter_fn=optimizers.exclude_bias_and_norm)
         pt = AddWeightDecay(0.1, exclude_bias_and_norm)
         self.helper_test_gradient_transform(jt, pt)
+
+    def test_scale_by_lars(self):
+        jt = optimizers.scale_by_lars()
+        pt = ScaleByLars()
+        self.helper_test_gradient_transform(jt, pt)
+
+    def helper_test_gradient_transform(self, jt, pt):
+        params, state, grads, m, torch_grad = self.grad_linear()
+        jstate = jt.init(params)
+        pt.init(m.parameters())
+        for i in range(3):
+            print(i)
+            jgrads, jstate = jt.update(grads, jstate, params)
+            pt.update()
+            tgrads = p2j_linear(m, 'linear', grad=True)
+            torch_grad()
+            assert allclose(jgrads, tgrads)
+
+class ScaleByLars:
+    def __init__(self, momentum=0.9, eta=0.001, filter_fn=None):
+        self.momentum = momentum
+        self.eta = eta
+        self.filter_fn = filter_fn
+
+    def init(self, params):
+        self.params = list(params)
+        self.mu = [torch.zeros_like(p) for p in self.params]
+
+    def update(self):
+        for param, mu in zip(self.params, self.mu):
+            if self.filter_fn is None or not self.filter_fn(param):
+                param_norm = torch.norm(param)
+                update_norm = torch.norm(param.grad)
+                ones = torch.ones_like(param_norm)
+                q = torch.where(param_norm > 0., torch.where(update_norm > 0, (self.eta * param_norm / update_norm), ones), ones)
+                param.grad.mul_(q)
+            mu.mul_(self.momentum).add_(param.grad)
+            param.grad.copy_(mu)
 
 def exclude_bias_and_norm(p):
     return p.ndim == 1
 
 class AddWeightDecay:
-    def __init__(self, weight_decay, filter_fn):
+    def __init__(self, weight_decay, filter_fn=None):
         self.weight_decay = weight_decay
         self.filter_fn = filter_fn
 
     def init(self, params):
-        self.params = params
+        self.params = list(params)
 
     def update(self):
-        for p in self.params:
-            if self.filter_fn is not None and self.filter_fn(p):
-                continue
-            print(p.shape)
-            p.grad.add_(p, alpha=self.weight_decay)
+        for param in self.params:
+            if self.filter_fn is None or not self.filter_fn(param):
+                param.grad.add_(param, alpha=self.weight_decay)
 
 class Scale:
     def __init__(self, scale_coeff):
         self.scale_coeff = scale_coeff
 
     def init(self, params):
-        self.params = params
+        self.params = list(params)
 
     def update(self):
         for p in self.params:
