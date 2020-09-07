@@ -312,6 +312,11 @@ class TestBYOL(unittest.TestCase):
         pt = ScaleByLars()
         self.helper_test_gradient_transform(jt, pt)
 
+    def test_lars(self):
+        jt = optimizers.lars(0.1)
+        pt = lars(0.1)
+        self.helper_test_gradient_transform(jt, pt)
+
     def helper_test_gradient_transform(self, jt, pt):
         params, state, grads, m, torch_grad = self.grad_linear()
         jstate = jt.init(params)
@@ -323,6 +328,26 @@ class TestBYOL(unittest.TestCase):
             tgrads = p2j_linear(m, 'linear', grad=True)
             torch_grad()
             assert allclose(jgrads, tgrads)
+
+def lars(learning_rate, weight_decay=0, momentum=0.9, eta=0.001, weight_decay_filter=None, lars_adaptation_filter=None):
+    return Chain(
+        AddWeightDecay(weight_decay=weight_decay, filter_fn=weight_decay_filter),
+        ScaleByLars(momentum=momentum, eta=eta, filter_fn=lars_adaptation_filter),
+        Scale(-learning_rate),
+    )
+
+class Chain:
+    def __init__(self, *transforms):
+        self.transforms = transforms
+
+    def init(self, params):
+        params = list(params)
+        for t in self.transforms:
+            t.init(params)
+
+    def update(self):
+        for t in self.transforms:
+            t.update()
 
 class ScaleByLars:
     def __init__(self, momentum=0.9, eta=0.001, filter_fn=None):
