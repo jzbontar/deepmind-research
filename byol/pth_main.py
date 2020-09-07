@@ -99,14 +99,6 @@ class TestBYOL(unittest.TestCase):
         tout = m(j2p_tensor(x))
         assert allclose(jout, tout, atol=1e-7)
 
-        def p2j_mlp(m, prefix):
-            bn_params, bn_state = p2j_batchnorm(m[1], f'{prefix}/batch_norm')
-            params = {
-                **p2j_linear(m[0], f'{prefix}/linear'),
-                **bn_params,
-                **p2j_linear(m[3], f'{prefix}/linear_1')}
-            return params, bn_state
-
         params1, state1 = p2j_mlp(m, 'predictor')
         jout1, _ = forward.apply(params1, state1, x, True)
         assert allclose(jout, j2p_tensor(jout1))
@@ -140,8 +132,12 @@ class TestBYOL(unittest.TestCase):
         m = nn.Conv2d(3, 8, 3, 1, 1, bias=False).cuda()
         m.load_state_dict(j2p_sd(j2p_conv('conv', params)))
         tout = m(j2p_tensor(x))
-
         assert allclose(jout, tout, atol=1e-5)
+
+        params1 = p2j_conv(m, 'conv')
+        jout1, _ = forward.apply(params1, state, x, True)
+        assert allclose(jout, j2p_tensor(jout1))
+
 
     def test_blockgroup(self):
         def _forward(inputs, is_training):
@@ -178,8 +174,11 @@ class TestBYOL(unittest.TestCase):
         m = resnet.layer4[0]
         m.load_state_dict(j2p_sd(j2p_block('res_net18/~/block_group_3/~/block_0/~', params, state)))
         tout = m(j2p_tensor(x))
-
         assert allclose(jout, tout, atol=1e-5)
+
+        params1, state1 = p2j_block(m, 'res_net18/~/block_group_3/~/block_0/~')
+        jout1, _ = forward.apply(params1, state1, x, True)
+        assert allclose(jout, j2p_tensor(jout1))
 
     def test_maxpool(self):
         def _forward(inputs):
@@ -280,8 +279,14 @@ def j2p_batchnorm(prefix, params, state):
         running_var=state[f'{prefix}/~/var_ema']['hidden'].ravel(),
         num_batches_tracked=0)
 
-def p2j_batchnorm(m, prefix):
-    params = {prefix: dict(scale=p2j_tensor(m.weight[None]), offset=p2j_tensor(m.bias[None]))}
+def p2j_batchnorm(m, prefix, ndim=2):
+    if ndim == 2:
+        w = m.weight[None]
+        b = m.bias[None]
+    elif ndim == 4:
+        w = m.weight[None, None, None]
+        b = m.bias[None, None, None]
+    params = {prefix: dict(scale=p2j_tensor(w), offset=p2j_tensor(b))}
     def ema(x):
         return dict(
             counter=p2j_tensor(m.num_batches_tracked),
@@ -311,6 +316,14 @@ def p2j_linear(m, prefix):
     if m.bias is not None:
         params['b'] = p2j_tensor(m.bias)
     return {prefix: params}
+
+def p2j_mlp(m, prefix):
+    bn_params, bn_state = p2j_batchnorm(m[1], f'{prefix}/batch_norm')
+    params = {
+        **p2j_linear(m[0], f'{prefix}/linear'),
+        **bn_params,
+        **p2j_linear(m[3], f'{prefix}/linear_1')}
+    return params, bn_state
 
 def p2j_resnet(m, prefix):
     return {}
@@ -489,9 +502,27 @@ def j2p_block(prefix, params, state):
             **add_prefix('downsample.1', j2p_batchnorm(f'{prefix}/shortcut_batchnorm', params, state)),
         )
     return d
+
+def p2j_block(m, prefix):
+    bn1_params, bn1_state = p2j_batchnorm(m.bn1, f'{prefix}/batchnorm_0', ndim=4)
+    bn2_params, bn2_state = p2j_batchnorm(m.bn2, f'{prefix}/batchnorm_1', ndim=4)
+    c1_params = p2j_conv(m.conv1, f'{prefix}/conv_0')
+    c2_params = p2j_conv(m.conv2, f'{prefix}/conv_1')
+    params = dict(**bn1_params, **bn2_params, **c1_params, **c2_params)
+    state = dict(**bn1_state, **bn2_state)
+    if hasattr(m, 'downsample'):
+        bn_params, bn_state = p2j_batchnorm(m.downsample[1], f'{prefix}/shortcut_batchnorm', ndim=4)
+        c_params = p2j_conv(m.downsample[0], f'{prefix}/shortcut_conv')
+        params.update(**bn_params, **c_params)
+        state.update(**bn_state)
+    return params, state
     
 def j2p_conv(prefix, params):
     return dict(weight=params[prefix]['w'].transpose((3, 2, 0, 1)), bias=params[prefix].get('b'))
+
+def p2j_conv(m, prefix):
+    assert m.bias is None
+    return {prefix: dict(w=p2j_tensor(m.weight.permute(2, 3, 1, 0)))}
 
 def add_prefix(prefix, params):
     return {f'{prefix}.{k}': v for k, v in params.items()}
