@@ -97,8 +97,19 @@ class TestBYOL(unittest.TestCase):
         m = MLP(3, 8, 4).cuda()
         m.load_state_dict(sd)
         tout = m(j2p_tensor(x))
-
         assert allclose(jout, tout, atol=1e-7)
+
+        def p2j_mlp(m, prefix):
+            bn_params, bn_state = p2j_batchnorm(m[1], f'{prefix}/batch_norm')
+            params = {
+                **p2j_linear(m[0], f'{prefix}/linear'),
+                **bn_params,
+                **p2j_linear(m[3], f'{prefix}/linear_1')}
+            return params, bn_state
+
+        params1, state1 = p2j_mlp(m, 'predictor')
+        jout1, _ = forward.apply(params1, state1, x, True)
+        assert allclose(jout, j2p_tensor(jout1))
 
     def test_resnet(self):
         def _forward(inputs, is_training):
@@ -296,10 +307,10 @@ def p2j_byol_network(m):
         **p2j_resnet(root.net, f'{prefix}res_net18/~/'))
 
 def p2j_linear(m, prefix):
-    return {prefix: dict(w=p2j_tensor(m.weight.T), b=p2j_tensor(m.bias))}
-
-def p2j_mlp(m, prefix):
-    return {}
+    params = dict(w=p2j_tensor(m.weight.T))
+    if m.bias is not None:
+        params['b'] = p2j_tensor(m.bias)
+    return {prefix: params}
 
 def p2j_resnet(m, prefix):
     return {}
