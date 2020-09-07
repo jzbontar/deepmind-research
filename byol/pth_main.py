@@ -3,7 +3,7 @@ import pickle
 
 import torch
 import torch.nn.functional as F
-from torch import nn
+from torch import nn, optim
 import torchvision
 
 import jax
@@ -328,6 +328,58 @@ class TestBYOL(unittest.TestCase):
             tgrads = p2j_linear(m, 'linear', grad=True)
             torch_grad()
             assert allclose(jgrads, tgrads)
+
+    def test_LARS(self):
+        params, state, grads, m, _ = self.grad_linear()
+        kwargs = dict(learning_rate=0.1, weight_decay=1e-2, momentum=0.9, eta=0.001)
+        pt = LARS(m.parameters(), weight_decay_filter=exclude_bias_and_norm, 
+                  lars_adaptation_filter=exclude_bias_and_norm, **kwargs)
+        jt = optimizers.lars(weight_decay_filter=optimizers.exclude_bias_and_norm,
+                             lars_adaptation_filter=optimizers.exclude_bias_and_norm, **kwargs)
+        jstate = jt.init(params)
+        for i in range(5):
+            print(i)
+            pt.step()
+            updates, jstate = jt.update(grads, jstate, params)
+            params = optax.apply_updates(params, updates)
+            assert allclose(params, p2j_linear(m, 'linear'))
+
+
+class LARS(optim.Optimizer):
+    def __init__(self, params, learning_rate, weight_decay=0, momentum=0.9, eta=0.001, 
+                 weight_decay_filter=None, lars_adaptation_filter=None):
+        defaults = dict(learning_rate=learning_rate, weight_decay=weight_decay, momentum=momentum, eta=eta, 
+                        weight_decay_filter=weight_decay_filter, lars_adaptation_filter=lars_adaptation_filter)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for g in self.param_groups:
+            for p in g['params']:
+                dp = p.grad
+
+                if g['weight_decay_filter'] is None or not g['weight_decay_filter'](p):
+                    dp = dp.add(p, alpha=g['weight_decay'])
+
+                if g['lars_adaptation_filter'] is None or not g['lars_adaptation_filter'](p):
+                    param_norm = torch.norm(p)
+                    update_norm = torch.norm(dp)
+                    one = torch.ones_like(param_norm)
+                    q = torch.where(param_norm > 0., 
+                                    torch.where(update_norm > 0, 
+                                                (g['eta'] * param_norm / update_norm), one), one)
+                    dp = dp.mul(q)
+
+                param_state = self.state[p]
+                if 'mu' not in param_state:
+                    mu = param_state['mu'] = torch.zeros_like(p)
+                else:
+                    mu = param_state['mu']
+                mu.mul_(g['momentum']).add_(dp)
+
+                p.add_(mu, alpha=-g['learning_rate'])
+
+
 
 def lars(learning_rate, weight_decay=0, momentum=0.9, eta=0.001, weight_decay_filter=None, lars_adaptation_filter=None):
     return Chain(
