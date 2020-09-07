@@ -268,7 +268,7 @@ class TestBYOL(unittest.TestCase):
 
     def grad_linear(self):
         def _forward(inputs):
-            return hk.Linear(output_size=4, with_bias=True)(inputs)
+            return hk.Linear(output_size=4, with_bias=True, b_init=hk.initializers.RandomNormal())(inputs)
 
         def _loss(params, state, k, inputs):
             jout, _ = forward.apply(params, state, inputs)
