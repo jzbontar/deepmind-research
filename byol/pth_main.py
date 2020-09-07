@@ -17,6 +17,7 @@ import numpy as np
 from byol.utils import augmentations
 from byol.utils import networks
 from byol.utils import dataset
+from byol.utils import optimizers
 import byol.byol_experiment
 import byol.jzb_resnet
 
@@ -30,11 +31,17 @@ def j2p_tensor(x):
     return y
 
 def allclose(jx, tx, **kwargs):
-    close = torch.allclose(j2p_tensor(jx), tx, **kwargs)
+    if isinstance(tx, dict):
+        assert jx.keys() == tx.keys()
+        return all(allclose(jx[k], tx[k]) for k in jx.keys())
+    if isinstance(jx, jnp.ndarray):
+        jx = j2p_tensor(jx)
+    if isinstance(tx, jnp.ndarray):
+        tx = j2p_tensor(tx)
+    close = torch.allclose(jx, tx, **kwargs)
     if not close:
-        print((j2p_tensor(jx) - tx).abs().max())
+        print((jx - tx).abs().max())
     return close
-        
 
 class TestBYOL(unittest.TestCase):
     def test_linear(self):
@@ -259,27 +266,90 @@ class TestBYOL(unittest.TestCase):
         for k in jout.keys():
             assert allclose(jout[k], tout[k])
 
+    def grad_linear(self):
+        def _forward(inputs):
+            return hk.Linear(output_size=4, with_bias=True)(inputs)
+
+        def _loss(params, state, k, inputs):
+            jout, _ = forward.apply(params, state, inputs)
+            return jnp.mean(jout)
+
+        forward = hk.without_apply_rng(hk.transform_with_state(_forward))
+        k = random.PRNGKey(0)
+        inputs = random.normal(k, (2, 3))
+        params, state = forward.init(k, inputs)
+        grad_fn = jax.grad(_loss)
+        grad = grad_fn(params, state, k, inputs)
+
+        m = nn.Linear(3, 4).cuda()
+        m.load_state_dict(j2p_sd(j2p_linear('linear', params)))
+        loss = m(j2p_tensor(inputs)).mean()
+        loss.backward()
+
+        return params, state, grad, m
+
+    def test_grad_linear(self):
+        grad, m = self.grad_linear()
+        grad1 = p2j_linear(m, 'linear', grad=True)
+
+        assert allclose(grad['linear']['w'], grad1['linear']['w'])
+        assert allclose(grad['linear']['b'], grad1['linear']['b'])
+
     def test_scale(self):
-        k = random.split(random.PRNGKey(0), 2)
-        params = [random.normal(k[0], (4,))]
-        grads = [random.normal(k[1], (4,))]
+        params, state, grads, m = self.grad_linear()
 
         t = optax.scale(2)
         state = t.init(params)
         jgrads, state = t.update(grads, state, params)
 
-        tparams = []
-        for p, g in zip(params, grads):
-            tparam = j2p_tensor(p)
-            tparam.grad = j2p_tensor(g)
-            tparams.append(tparam)
-
         t = Scale(2)
-        t.init(tparams)
+        t.init(m.parameters())
         t.update()
-        tgrads = [p.grad for p in tparams]
+        tgrads = p2j_linear(m, 'linear', grad=True)
 
-        assert allclose(jgrads[0], tgrads[0])
+        assert allclose(jgrads, tgrads)
+
+    def test_weight_decay(self):
+        params, state, grads, m = self.grad_linear()
+
+        t = optimizers.add_weight_decay(0.1, filter_fn=optimizers.exclude_bias_and_norm)
+        state = t.init(params)
+        jgrads, state = t.update(grads, state, params)
+
+        t = AddWeightDecay(0.1, exclude_bias_and_norm)
+        t.init(m.parameters())
+        t.update()
+        tgrads = p2j_linear(m, 'linear', grad=True)
+
+        assert allclose(jgrads, tgrads)
+
+def exclude_bias_and_norm(p):
+    return p.ndim == 1
+
+class AddWeightDecay:
+    def __init__(self, weight_decay, filter_fn):
+        self.weight_decay = weight_decay
+        self.filter_fn = filter_fn
+
+    def init(self, params):
+        self.params = params
+
+    def update(self):
+        for p in self.params:
+            if self.filter_fn(p):
+                continue
+            p.grad.add_(p, alpha=self.weight_decay)
+
+class Scale:
+    def __init__(self, scale_coeff):
+        self.scale_coeff = scale_coeff
+
+    def init(self, params):
+        self.params = params
+
+    def update(self):
+        for p in self.params:
+            p.grad.mul_(self.scale_coeff)
 
 def j2p_batchnorm(prefix, params, state):
     assert state[f'{prefix}/~/var_ema']['counter'] == 0
@@ -312,10 +382,10 @@ def p2j_batchnorm(m, prefix, batch_size=4, ndim=2):
 def p2j_tensor(x):
     return jnp.array(x.detach().cpu().numpy())
 
-def p2j_linear(m, prefix):
-    params = dict(w=p2j_tensor(m.weight.T))
+def p2j_linear(m, prefix, grad=False):
+    params = dict(w=p2j_tensor(m.weight.grad.T if grad else m.weight.T))
     if m.bias is not None:
-        params['b'] = p2j_tensor(m.bias)
+        params['b'] = p2j_tensor(m.bias.grad if grad else m.bias)
     return {prefix: params}
 
 def p2j_mlp(m, prefix):
@@ -325,31 +395,6 @@ def p2j_mlp(m, prefix):
         **bn_params,
         **p2j_linear(m[3], f'{prefix}/linear_1')}
     return params, bn_state
-
-class AddWeightDecay:
-    def __init__(self, weight_decay):
-        self.weight_decay = weight_decay
-
-    def init(self, params):
-        self.params = params
-
-    def update(self):
-        for p in self.params:
-            if p.ndim == 1:
-                continue
-            p.grad.add_(p, alpha=self.weight_decay)
-
-class Scale:
-    def __init__(self, scale_coeff):
-        self.scale_coeff = scale_coeff
-
-    def init(self, params):
-        self.params = params
-
-    def update(self):
-        for p in self.params:
-            p.grad.mul_(self.scale_coeff)
-
 
 def j2p_byol_module(state):
     return dict(
