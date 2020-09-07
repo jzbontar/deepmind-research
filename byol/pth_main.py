@@ -295,33 +295,25 @@ class TestBYOL(unittest.TestCase):
         assert allclose(grad['linear']['w'], grad1['linear']['w'])
         assert allclose(grad['linear']['b'], grad1['linear']['b'])
 
-    def test_scale(self):
+    def helper_test_gradient_transform(self, jt, pt):
         params, state, grads, m = self.grad_linear()
 
-        t = optax.scale(2)
-        state = t.init(params)
-        jgrads, state = t.update(grads, state, params)
+        state = jt.init(params)
+        jgrads, state = jt.update(grads, state, params)
 
-        t = Scale(2)
-        t.init(m.parameters())
-        t.update()
+        pt.init(m.parameters())
+        pt.update()
         tgrads = p2j_linear(m, 'linear', grad=True)
 
         assert allclose(jgrads, tgrads)
+
+    def test_scale(self):
+        self.helper_test_gradient_transform(optax.scale(2), Scale(2))
 
     def test_weight_decay(self):
-        params, state, grads, m = self.grad_linear()
-
-        t = optimizers.add_weight_decay(0.1, filter_fn=optimizers.exclude_bias_and_norm)
-        state = t.init(params)
-        jgrads, state = t.update(grads, state, params)
-
-        t = AddWeightDecay(0.1, exclude_bias_and_norm)
-        t.init(m.parameters())
-        t.update()
-        tgrads = p2j_linear(m, 'linear', grad=True)
-
-        assert allclose(jgrads, tgrads)
+        jt = optimizers.add_weight_decay(0.1, filter_fn=optimizers.exclude_bias_and_norm)
+        pt = AddWeightDecay(0.1, exclude_bias_and_norm)
+        self.helper_test_gradient_transform(jt, pt)
 
 def exclude_bias_and_norm(p):
     return p.ndim == 1
@@ -336,8 +328,9 @@ class AddWeightDecay:
 
     def update(self):
         for p in self.params:
-            if self.filter_fn(p):
+            if self.filter_fn is not None and self.filter_fn(p):
                 continue
+            print(p.shape)
             p.grad.add_(p, alpha=self.weight_decay)
 
 class Scale:
