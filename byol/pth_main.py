@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 import torchvision
 
+import jax
 import haiku as hk
 from jax import random
 import jax.numpy as jnp
@@ -19,7 +20,7 @@ from byol.utils import dataset
 import byol.byol_experiment
 import byol.jzb_resnet
 
-def j2t(x):
+def j2p_tensor(x):
     y = torch.from_numpy(np.asarray(x).copy())
     if y.dtype == torch.int32:
         y = y.long()
@@ -29,9 +30,9 @@ def j2t(x):
     return y
 
 def allclose(jx, tx, **kwargs):
-    close = torch.allclose(j2t(jx), tx, **kwargs)
+    close = torch.allclose(j2p_tensor(jx), tx, **kwargs)
     if not close:
-        print((j2t(jx) - tx).abs().max())
+        print((j2p_tensor(jx) - tx).abs().max())
     return close
         
 
@@ -43,16 +44,20 @@ class TestBYOL(unittest.TestCase):
         k = random.PRNGKey(0)
         inputs = random.normal(k, (2, 3))
         params, state = forward.init(k, inputs)
-        jout, new_state = forward.apply(params, state, inputs)
+        jout, _ = forward.apply(params, state, inputs)
 
         m = nn.Linear(3, 4).cuda()
         sd = {}
-        sd['weight'] = j2t(params['linear']['w'].T)
-        sd['bias'] = j2t(params['linear']['b'])
+        sd['weight'] = j2p_tensor(params['linear']['w'].T)
+        sd['bias'] = j2p_tensor(params['linear']['b'])
         m.load_state_dict(sd)
-        tout = m(j2t(inputs))
-
+        tout = m(j2p_tensor(inputs))
         assert allclose(jout, tout)
+
+        params2 = p2j_linear(m, 'linear')
+        jout2, _ = forward.apply(params2, state, inputs)
+        assert allclose(jout2, tout)
+
 
     def test_bn(self):
         def _forward(inputs, is_training):
@@ -65,24 +70,18 @@ class TestBYOL(unittest.TestCase):
         params, state0 = forward.init(k, x[0], True)
         jout1, state1 = forward.apply(params, state0, x[1], True)
         jout2, state2 = forward.apply(params, state1, x[2], True)
-        jout3, state3 = forward.apply(params, state2, x[3], False)
 
         m = nn.BatchNorm1d(3).cuda()
-        m.running_var.zero_()
-        tout1 = m.forward(j2t(x[1]))
-        tout2 = m.forward(j2t(x[2]))
-
-        def zero_debias(x, decay, counter):
-            return x / (1 - decay**counter)
-
-        batch_size = 4
-        m.running_mean = zero_debias(m.running_mean, 1 - m.momentum, m.num_batches_tracked)
-        m.running_var = zero_debias(m.running_var * (batch_size - 1) / batch_size, 1 - m.momentum, m.num_batches_tracked)
-        tout3 = m.eval().forward(j2t(x[3]))
-
+        m.load_state_dict(j2p_sd(j2p_batchnorm('batch_norm', params, state0)))
+        tout1 = m.forward(j2p_tensor(x[1]))
+        tout2 = m.forward(j2p_tensor(x[2]))
         assert allclose(jout1, tout1)
         assert allclose(jout2, tout2)
-        assert allclose(jout3, tout3, atol=1e-7)
+
+        jout3, state3 = forward.apply(params, state2, x[3], False)
+        params4, state4 = p2j_batchnorm(m, 'batch_norm')
+        jout4, _ = forward.apply(params4, state4, x[3], False)
+        assert allclose(jout3, j2p_tensor(jout4), atol=1e-7)
 
     def test_mlp(self):
         def _forward(inputs, is_training):
@@ -94,10 +93,10 @@ class TestBYOL(unittest.TestCase):
         params, state = forward.init(k, x, True)
         jout, _ = forward.apply(params, state, x, True)
 
-        sd = sd_j2t(convert_mlp('predictor', params, state))
+        sd = j2p_sd(j2p_mlp('predictor', params, state))
         m = MLP(3, 8, 4).cuda()
         m.load_state_dict(sd)
-        tout = m(j2t(x))
+        tout = m(j2p_tensor(x))
 
         assert allclose(jout, tout, atol=1e-7)
 
@@ -111,10 +110,10 @@ class TestBYOL(unittest.TestCase):
         params, state = forward.init(k, x, True)
         jout, _ = forward.apply(params, state, x, True)
 
-        sd = sd_j2t(convert_resnet('res_net18/~', params, state))
+        sd = j2p_sd(j2p_resnet('res_net18/~', params, state))
         m = byol.jzb_resnet.resnet18().cuda()
         m.load_state_dict(sd)
-        tout = m(j2t(x))
+        tout = m(j2p_tensor(x))
 
         assert allclose(jout, tout, atol=1e-3)
 
@@ -128,8 +127,8 @@ class TestBYOL(unittest.TestCase):
         jout, _ = forward.apply(params, state, x, True)
 
         m = nn.Conv2d(3, 8, 3, 1, 1, bias=False).cuda()
-        m.load_state_dict(sd_j2t(convert_conv('conv', params)))
-        tout = m(j2t(x))
+        m.load_state_dict(j2p_sd(j2p_conv('conv', params)))
+        tout = m(j2p_tensor(x))
 
         assert allclose(jout, tout, atol=1e-5)
 
@@ -147,8 +146,8 @@ class TestBYOL(unittest.TestCase):
 
         resnet = byol.jzb_resnet.resnet18().cuda()
         m = resnet.layer4
-        m.load_state_dict(sd_j2t(convert_blockgroup('res_net18/~/block_group_3/~', params, state)))
-        tout = m(j2t(x))
+        m.load_state_dict(j2p_sd(j2p_blockgroup('res_net18/~/block_group_3/~', params, state)))
+        tout = m(j2p_tensor(x))
 
         assert allclose(jout, tout, atol=1e-5)
 
@@ -166,8 +165,8 @@ class TestBYOL(unittest.TestCase):
 
         resnet = byol.jzb_resnet.resnet18().cuda()
         m = resnet.layer4[0]
-        m.load_state_dict(sd_j2t(convert_block('res_net18/~/block_group_3/~/block_0/~', params, state)))
-        tout = m(j2t(x))
+        m.load_state_dict(j2p_sd(j2p_block('res_net18/~/block_group_3/~/block_0/~', params, state)))
+        tout = m(j2p_tensor(x))
 
         assert allclose(jout, tout, atol=1e-5)
 
@@ -184,7 +183,7 @@ class TestBYOL(unittest.TestCase):
             nn.ConstantPad2d((0, 1, 0, 1), -2e38),
             nn.MaxPool2d(kernel_size=3, stride=2, padding=0),
         )
-        tout = m(j2t(x))
+        tout = m(j2p_tensor(x))
 
         assert allclose(jout, tout, atol=1e-5)
 
@@ -199,11 +198,12 @@ class TestBYOL(unittest.TestCase):
         exp = byol.byol_experiment.ByolExperiment(**kwargs)
         params, state = exp.forward.init(k0, input, is_training=True)
         jout, _ = exp.forward.apply(params, state, input, is_training=True)
+        # pickle.dump((params, state), open('foo.pkl', 'wb'))
         
         m = ByolNetwork().cuda()
-        sd = sd_j2t(convert_byol_network(params, state))
+        sd = j2p_sd(j2p_byol_network(params, state))
         m.load_state_dict(sd)
-        tout = m({k: j2t(v) for k, v in input.items()})
+        tout = m({k: j2p_tensor(v) for k, v in input.items()})
 
         assert jout.keys() == tout.keys()
         for k in jout.keys():
@@ -227,7 +227,7 @@ class TestBYOL(unittest.TestCase):
             target_state=state.target_state)
 
         m = ByolModule().cuda()
-        sd = sd_j2t(convert_byol_module(state))
+        sd = j2p_sd(j2p_byol_module(state))
         m.load_state_dict(sd)
         tout = m(input, k0)
 
@@ -249,8 +249,8 @@ class TestBYOL(unittest.TestCase):
 
         tparams = []
         for p, g in zip(params, grads):
-            tparam = j2t(p)
-            tparam.grad = j2t(g)
+            tparam = j2p_tensor(p)
+            tparam.grad = j2p_tensor(g)
             tparams.append(tparam)
 
         t = Scale(2)
@@ -260,7 +260,62 @@ class TestBYOL(unittest.TestCase):
 
         assert allclose(jgrads[0], tgrads[0])
 
+def j2p_batchnorm(prefix, params, state):
+    assert state[f'{prefix}/~/var_ema']['counter'] == 0
+    return dict(
+        weight=params[prefix]['scale'].ravel(), 
+        bias=params[prefix]['offset'].ravel(), 
+        running_mean=state[f'{prefix}/~/mean_ema']['hidden'].ravel(), 
+        running_var=state[f'{prefix}/~/var_ema']['hidden'].ravel(),
+        num_batches_tracked=0)
+
+def p2j_batchnorm(m, prefix):
+    params = {prefix: dict(scale=p2j_tensor(m.weight[None]), offset=p2j_tensor(m.bias[None]))}
+    def ema(x):
+        return dict(
+            counter=p2j_tensor(m.num_batches_tracked),
+            hidden=p2j_tensor(x),
+            average=p2j_tensor(x / (1 - 0.9**m.num_batches_tracked)))
+    state = {
+        f'{prefix}/~/mean_ema': ema(m.running_mean),
+        f'{prefix}/~/var_ema': ema(3 / 4 * m.running_var),
+    }
+    return params, state
+
+def p2j_tensor(x):
+    return jnp.array(x.detach().cpu().numpy())
+
+def p2j_byol_module(m):
+    return dict(target=p2j_byol_network(root.target), online=p2j_byol_network(root.online))
+
+def p2j_byol_network(m):
+    return dict(
+        **p2j_mlp(root.projector, f'{prefix}projector/'),
+        **p2j_mlp(root.predictor, f'{prefix}predictor/'),
+        **p2j_linear(root.classifier, f'{prefix}classifier/'),
+        **p2j_resnet(root.net, f'{prefix}res_net18/~/'))
+
+def p2j_linear(m, prefix):
+    return {prefix: dict(w=p2j_tensor(m.weight.T), b=p2j_tensor(m.bias))}
+
+def p2j_mlp(m, prefix):
+    return {}
+
+def p2j_resnet(m, prefix):
+    return {}
         
+class AddWeightDecay:
+    def __init__(self, weight_decay):
+        self.weight_decay = weight_decay
+
+    def init(self, params):
+        self.params = params
+
+    def update(self):
+        for p in self.params:
+            if p.ndim == 1:
+                continue
+            p.grad.add_(p, alpha=self.weight_decay)
 
 class Scale:
     def __init__(self, scale_coeff):
@@ -274,10 +329,10 @@ class Scale:
             p.grad.mul_(self.scale_coeff)
 
 
-def convert_byol_module(state):
+def j2p_byol_module(state):
     return dict(
-        **add_prefix('online', convert_byol_network(state.online_params, state.online_state)),
-        **add_prefix('target', convert_byol_network(state.target_params, state.target_state)),
+        **add_prefix('online', j2p_byol_network(state.online_params, state.online_state)),
+        **add_prefix('target', j2p_byol_network(state.target_params, state.target_state)),
     )
     
 def normalize_images(images):
@@ -316,7 +371,7 @@ class ByolModule(nn.Module):
 
     def forward(self, inputs, rng):
         inputs = augmentations.postprocess(inputs, rng)
-        inputs = {k: j2t(v) for k, v in inputs.items()}
+        inputs = {k: j2p_tensor(v) for k, v in inputs.items()}
         labels = inputs['labels']
 
         online_network_out = self.online(inputs)
@@ -386,67 +441,60 @@ class ByolNetwork(nn.Module):
         else:
             return apply_once_fn(inputs['images'], '')
 
-def convert_byol_network(params, state):
+def j2p_byol_network(params, state):
     return dict(
-        **add_prefix('classifier', convert_linear('classifier', params)),
-        **add_prefix('predictor', convert_mlp('predictor', params, state)),
-        **add_prefix('projector', convert_mlp('projector', params, state)),
-        **add_prefix('net', convert_resnet('res_net18/~', params, state)),
+        **add_prefix('classifier', j2p_linear('classifier', params)),
+        **add_prefix('predictor', j2p_mlp('predictor', params, state)),
+        **add_prefix('projector', j2p_mlp('projector', params, state)),
+        **add_prefix('net', j2p_resnet('res_net18/~', params, state)),
     )
 
-def convert_resnet(prefix, params, state):
+def j2p_resnet(prefix, params, state):
     return dict(
-        **add_prefix('conv1', convert_conv(f'{prefix}/initial_conv', params)),
-        **add_prefix('bn1', convert_batchnorm(f'{prefix}/initial_batchnorm', params, state)),
-        **add_prefix('layer1', convert_blockgroup(f'{prefix}/block_group_0/~', params, state)),
-        **add_prefix('layer2', convert_blockgroup(f'{prefix}/block_group_1/~', params, state)),
-        **add_prefix('layer3', convert_blockgroup(f'{prefix}/block_group_2/~', params, state)),
-        **add_prefix('layer4', convert_blockgroup(f'{prefix}/block_group_3/~', params, state)),
+        **add_prefix('conv1', j2p_conv(f'{prefix}/initial_conv', params)),
+        **add_prefix('bn1', j2p_batchnorm(f'{prefix}/initial_batchnorm', params, state)),
+        **add_prefix('layer1', j2p_blockgroup(f'{prefix}/block_group_0/~', params, state)),
+        **add_prefix('layer2', j2p_blockgroup(f'{prefix}/block_group_1/~', params, state)),
+        **add_prefix('layer3', j2p_blockgroup(f'{prefix}/block_group_2/~', params, state)),
+        **add_prefix('layer4', j2p_blockgroup(f'{prefix}/block_group_3/~', params, state)),
     )
 
-def convert_blockgroup(prefix, params, state):
+def j2p_blockgroup(prefix, params, state):
     return dict(
-        **add_prefix('0', convert_block(f'{prefix}/block_0/~', params, state)),
-        **add_prefix('1', convert_block(f'{prefix}/block_1/~', params, state)),
+        **add_prefix('0', j2p_block(f'{prefix}/block_0/~', params, state)),
+        **add_prefix('1', j2p_block(f'{prefix}/block_1/~', params, state)),
     )
 
-def convert_block(prefix, params, state):
+def j2p_block(prefix, params, state):
     d = dict(
-        **add_prefix('conv1', convert_conv(f'{prefix}/conv_0', params)),
-        **add_prefix('bn1', convert_batchnorm(f'{prefix}/batchnorm_0', params, state)),
-        **add_prefix('conv2', convert_conv(f'{prefix}/conv_1', params)),
-        **add_prefix('bn2', convert_batchnorm(f'{prefix}/batchnorm_1', params, state)),
+        **add_prefix('conv1', j2p_conv(f'{prefix}/conv_0', params)),
+        **add_prefix('bn1', j2p_batchnorm(f'{prefix}/batchnorm_0', params, state)),
+        **add_prefix('conv2', j2p_conv(f'{prefix}/conv_1', params)),
+        **add_prefix('bn2', j2p_batchnorm(f'{prefix}/batchnorm_1', params, state)),
     )
     if prefix.endswith('/block_0/~'):
         d.update(
-            **add_prefix('downsample.0', convert_conv(f'{prefix}/shortcut_conv', params)),
-            **add_prefix('downsample.1', convert_batchnorm(f'{prefix}/shortcut_batchnorm', params, state)),
+            **add_prefix('downsample.0', j2p_conv(f'{prefix}/shortcut_conv', params)),
+            **add_prefix('downsample.1', j2p_batchnorm(f'{prefix}/shortcut_batchnorm', params, state)),
         )
     return d
     
-def convert_conv(prefix, params):
+def j2p_conv(prefix, params):
     return dict(weight=params[prefix]['w'].transpose((3, 2, 0, 1)), bias=params[prefix].get('b'))
 
 def add_prefix(prefix, params):
     return {f'{prefix}.{k}': v for k, v in params.items()}
 
-def sd_j2t(sd):
+def j2p_sd(sd):
     return {k: torch.from_numpy(np.asarray(v).copy()) for k, v in sd.items() if v is not None}
 
-def convert_mlp(prefix, params, state):
+def j2p_mlp(prefix, params, state):
     return dict(
-        **add_prefix('0', convert_linear(f'{prefix}/linear', params)),
-        **add_prefix('1', convert_batchnorm(f'{prefix}/batch_norm', params, state)),
-        **add_prefix('3', convert_linear(f'{prefix}/linear_1', params)))
+        **add_prefix('0', j2p_linear(f'{prefix}/linear', params)),
+        **add_prefix('1', j2p_batchnorm(f'{prefix}/batch_norm', params, state)),
+        **add_prefix('3', j2p_linear(f'{prefix}/linear_1', params)))
 
-def convert_batchnorm(prefix, params, state):
-    return dict(
-        weight=params[prefix]['scale'].ravel(), 
-        bias=params[prefix]['offset'].ravel(), 
-        running_mean=state[f'{prefix}/~/mean_ema']['hidden'].ravel(), 
-        running_var=state[f'{prefix}/~/var_ema']['hidden'].ravel())
-
-def convert_linear(prefix, params):
+def j2p_linear(prefix, params):
     return dict(weight=params[prefix]['w'].T, bias=params[prefix].get('b'))
 
 def MLP(input_size, hidden_size, output_size):
