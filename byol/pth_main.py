@@ -221,10 +221,14 @@ class TestBYOL(unittest.TestCase):
         sd = j2p_sd(j2p_byol_network(params, state))
         m.load_state_dict(sd)
         tout = m({k: j2p_tensor(v) for k, v in input.items()})
-
         assert jout.keys() == tout.keys()
         for k in jout.keys():
             assert allclose(jout[k], tout[k], atol=2e-3)
+
+        params1, state1 = p2j_byol_network(m)
+        jout1, _ = exp.forward.apply(params1, state1, input, is_training=True)
+        for k in jout.keys():
+            assert allclose(jout[k], j2p_tensor(jout1[k]))
     
     def test_loss_fn(self):
         k0, k1, k2, k3 = random.split(random.PRNGKey(0), 4)
@@ -352,7 +356,7 @@ def j2p_byol_module(state):
         **add_prefix('online', j2p_byol_network(state.online_params, state.online_state)),
         **add_prefix('target', j2p_byol_network(state.target_params, state.target_state)),
     )
-    
+
 def normalize_images(images):
     """Normalize the image using ImageNet statistics."""
     mean_rgb = (0.485, 0.456, 0.406)
@@ -466,6 +470,13 @@ def j2p_byol_network(params, state):
         **add_prefix('projector', j2p_mlp('projector', params, state)),
         **add_prefix('net', j2p_resnet('res_net18/~', params, state)),
     )
+
+def p2j_byol_network(m):
+    p0 = p2j_linear(m.classifier, 'classifier')
+    p1, s1 = p2j_mlp(m.predictor, 'predictor')
+    p2, s2 = p2j_mlp(m.projector, 'projector')
+    p3, s3 = p2j_resnet(m.net, 'res_net18/~', [2, 2, 2, 2])
+    return {**p0, **p1, **p2, **p3}, {**s1, **s2, **s3}
 
 def j2p_resnet(prefix, params, state):
     return dict(
