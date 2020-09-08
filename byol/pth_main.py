@@ -19,6 +19,7 @@ import haiku as hk
 from jax import random
 import jax.numpy as jnp
 import optax
+import dill
 
 import numpy as np
 
@@ -28,6 +29,7 @@ from byol.utils import dataset
 from byol.utils import optimizers
 from byol.utils import dataset
 from byol.utils import schedules
+from byol.utils import checkpointing
 from byol.configs import byol as byol_config
 import byol.byol_experiment
 import byol.jzb_resnet
@@ -43,9 +45,18 @@ def main(args):
 
     tr = dataset.load(dataset.Split.TRAIN_AND_VALID, preprocess_mode=dataset.PreprocessMode.PRETRAIN, transpose=False, batch_dims=[args.batch_size])
     tr = acme_utils.prefetch(tr)
-    model = ByolModule().cuda()
+    model = ByolModel().cuda()
     optimizer = LARS(model.parameters(), learning_rate=None)
     rng = random.PRNGKey(0)
+
+    if args.convert_to_jax:
+        model.load_state_dict(torch.load(args.convert_to_jax, map_location='cpu'))
+        byol_state = p2j_byol_model(model)
+        byol_state = jax.tree_map(lambda x: jax.device_get(x), byol_state)
+        checkpoint_data = dict(experiment_state=byol_state, step=36988, rng=rng)
+        with open(args.tmp_dir / 'pretrain.pkl', 'wb') as checkpoint_file:
+            dill.dump(checkpoint_data, checkpoint_file, protocol=2)
+        exit()
     
     if False:
         print('initialize BYOL model from JAX')
@@ -300,7 +311,7 @@ class TestBYOL(unittest.TestCase):
             target_params=state.target_params, 
             target_state=state.target_state)
 
-        m = ByolModule().cuda()
+        m = ByolModel().cuda()
         sd = j2p_sd(j2p_byol_module(state))
         m.load_state_dict(sd)
         tout = m(input, k0)
@@ -481,7 +492,7 @@ def j2p_batchnorm(prefix, params, state):
         running_var=state[f'{prefix}/~/var_ema']['hidden'].ravel(),
         num_batches_tracked=0)
 
-def p2j_batchnorm(m, prefix, batch_size=4, ndim=2):
+def p2j_batchnorm(m, prefix, batch_size=256, ndim=2):
     if ndim == 2:
         w = m.weight[None]
         b = m.bias[None]
@@ -551,7 +562,7 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(1 / batch_size))
         return res
 
-class ByolModule(nn.Module):
+class ByolModel(nn.Module):
     postprocess_jit = jax.jit(augmentations.postprocess)
 
     def __init__(self):
@@ -560,7 +571,7 @@ class ByolModule(nn.Module):
         self.target = ByolNetwork()
 
     def forward(self, inputs, rng):
-        inputs = ByolModule.postprocess_jit(inputs, rng)
+        inputs = ByolModel.postprocess_jit(inputs, rng)
         inputs = {k: j2p_tensor(v) for k, v in inputs.items()}
         labels = inputs['labels']
 
@@ -630,6 +641,13 @@ class ByolNetwork(nn.Module):
             return {**outputs_view1, **outputs_view2}
         else:
             return apply_once_fn(inputs['images'], '')
+
+def p2j_byol_model(m):
+    op, os = p2j_byol_network(m.online)
+    tp, ts = p2j_byol_network(m.target)
+    return byol.byol_experiment._ByolExperimentState(opt_state=None,
+        online_params=op, online_state=os,
+        target_params=tp, target_state=ts)
 
 def j2p_byol_network(params, state):
     return dict(
@@ -743,6 +761,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=4096)
     parser.add_argument('--pretrain-epochs', type=int, default=1000)
     parser.add_argument('--log-tensors-interval', type=int, default=60)
+    parser.add_argument('--convert-to-jax', type=Path)
     parser.add_argument('--tmp-dir', type=Path, default='/checkpoint/jzb/tmp')
     args = parser.parse_args()
 
