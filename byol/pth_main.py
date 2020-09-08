@@ -538,13 +538,15 @@ def accuracy(output, target, topk=(1,)):
         return res
 
 class ByolModule(nn.Module):
+    postprocess_jit = jax.jit(augmentations.postprocess)
+
     def __init__(self):
         super().__init__()
         self.online = ByolNetwork()
         self.target = ByolNetwork()
 
     def forward(self, inputs, rng):
-        inputs = augmentations.postprocess(inputs, rng)
+        inputs = ByolModule.postprocess_jit(inputs, rng)
         inputs = {k: j2p_tensor(v) for k, v in inputs.items()}
         labels = inputs['labels']
 
