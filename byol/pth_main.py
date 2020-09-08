@@ -39,26 +39,21 @@ def update_target(model, tau):
 
 def main(args):
     config = byol_config.get_config(args.pretrain_epochs, args.batch_size)
-    del config['network_config']['bn_config']['cross_replica_axis']
-
     torch.backends.cudnn.benchmark = True
 
-    tr = dataset.load(
-        dataset.Split.TRAIN_AND_VALID,
-        preprocess_mode=dataset.PreprocessMode.PRETRAIN,
-        transpose=False,
-        batch_dims=[args.batch_size])
+    tr = dataset.load(dataset.Split.TRAIN_AND_VALID, preprocess_mode=dataset.PreprocessMode.PRETRAIN, transpose=False, batch_dims=[args.batch_size])
     tr = acme_utils.prefetch(tr)
-
-    rng = random.PRNGKey(0)
     model = ByolModule().cuda()
     optimizer = LARS(model.parameters(), learning_rate=None)
+    rng = random.PRNGKey(0)
     
-    # print('initialize BYOL model from JAX')
-    # experiment = byol.byol_experiment.ByolExperiment(**config)
-    # state = experiment._make_initial_state(rng, next(tr))
-    # sd = j2p_sd(j2p_byol_module(state))
-    # torch.save(sd, args.tmp_dir / 'byol_init.pth')
+    if False:
+        print('initialize BYOL model from JAX')
+        del config['network_config']['bn_config']['cross_replica_axis']
+        experiment = byol.byol_experiment.ByolExperiment(**config)
+        state = experiment._make_initial_state(rng, next(tr))
+        sd = j2p_sd(j2p_byol_module(state))
+        torch.save(sd, args.tmp_dir / 'byol_init.pth')
     model.load_state_dict(torch.load(args.tmp_dir / 'byol_init.pth', map_location='cpu'))
 
     start_time = last_logging = time.time()
