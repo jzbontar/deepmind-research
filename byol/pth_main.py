@@ -350,7 +350,20 @@ class TestBYOL(unittest.TestCase):
         self.assertAlmostEqual(schedules._cosine_decay(jnp.array([0]), 10, 2)[0], cosine_decay(0, 10, 2))
         self.assertAlmostEqual(schedules._cosine_decay(jnp.array([10]), 100, 4)[0], cosine_decay(10, 100, 4))
 
+    def test_learning_schedule(self):
+        config = dict(batch_size=4096, base_learning_rate=3, total_steps=20, warmup_steps=5)
+        for step in range(config['total_steps']):
+            jout = learning_schedule(step, **config)
+            tout = schedules.learning_schedule(jnp.array([step]), **config)[0]
+            self.assertAlmostEqual(tout, jout, places=4)
 
+def learning_schedule(global_step, batch_size, base_learning_rate, total_steps, warmup_steps):
+    scaled_lr = base_learning_rate * batch_size / 256.
+    learning_rate = global_step / warmup_steps * scaled_lr if warmup_steps > 0 else scaled_lr
+    if global_step < warmup_steps:
+        return learning_rate
+    else:
+        return cosine_decay(global_step - warmup_steps, total_steps - warmup_steps, scaled_lr)
 
 def cosine_decay(global_step, max_steps, initial_value):
     global_step = min(global_step, max_steps)
