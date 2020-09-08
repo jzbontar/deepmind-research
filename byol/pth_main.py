@@ -801,7 +801,7 @@ def MLP(input_size, hidden_size, output_size):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch-size', type=int, default=4096)
-    parser.add_argument('--num-workers', type=int, default=1)
+    parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--pretrain-epochs', type=int, default=1000)
     parser.add_argument('--log-tensors-interval', type=int, default=60)
     parser.add_argument('--convert-to-jax', type=Path)
