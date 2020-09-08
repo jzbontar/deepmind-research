@@ -28,6 +28,11 @@ from byol.configs import byol as byol_config
 import byol.byol_experiment
 import byol.jzb_resnet
 
+@torch.no_grad()
+def update_target(model, tau):
+    for tp, op in zip(model.target.parameters(), model.online.parameters()):
+        tp.mul_(tau).add_(op, alpha=1 - tau)
+
 def main(args):
     config = byol_config.get_config(args.pretrain_epochs, args.batch_size)
     del config['network_config']['bn_config']['cross_replica_axis']
@@ -44,7 +49,7 @@ def main(args):
     rng = random.PRNGKey(0)
     model = ByolModule().cuda()
     optimizer = LARS(model.parameters(), learning_rate=None)
-
+    
     # print('initialize BYOL model from JAX')
     # experiment = byol.byol_experiment.ByolExperiment(**config)
     # state = experiment._make_initial_state(rng, next(tr))
@@ -53,13 +58,22 @@ def main(args):
     model.load_state_dict(torch.load(args.tmp_dir / 'init_byol.pth', map_location='cpu'))
 
     for step in range(config['max_steps']):
-        inputs = next(tr)
+        lr = learning_schedule(global_step=step, batch_size=args.batch_size, total_steps=config['max_steps'], **config['lr_schedule_config'])
+        for g in optimizer.param_groups:
+            g['learning_rate'] = lr
+
         step_rng, rng = jax.random.split(rng)
-
+        inputs = next(tr)
         loss, logs = model.forward(inputs, step_rng)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-        print(step_rng)
-        exit()
+        tau = target_ema(global_step=step, base_ema=config['base_target_ema'], max_steps=config['max_steps'])
+        update_target(model, tau)
+
+        state = dict(step=step, loss=loss.item(), lr=lr, tau=tau)
+        print(state)
     
 class TestBYOL(unittest.TestCase):
     FLAGS = {'random_seed': 0, 'num_classes': 10, 'batch_size': 256, 'max_steps': 36988, 'enable_double_transpose': True, 'base_target_ema': 0.996, 'network_config': {'projector_hidden_size': 4096, 'projector_output_size': 256, 'predictor_hidden_size': 4096, 'encoder_class': 'ResNet18', 'encoder_config': {'resnet_v2': False, 'width_multiplier': 1}, 'bn_config': {'decay_rate': 0.9, 'eps': 1e-05, 'create_scale': True, 'create_offset': True}}, 'optimizer_config': {'weight_decay': 1e-06, 'eta': 0.001, 'momentum': 0.9}, 'lr_schedule_config': {'base_learning_rate': 2.0, 'warmup_steps': 369}, 'evaluation_config': {'subset': 'test', 'batch_size': 25}, 'checkpointing_config': {'use_checkpointing': True, 'checkpoint_dir': '/scratch/jzb/byol_checkpoints', 'save_checkpoint_interval': 300, 'filename': 'pretrain.pkl'}}
@@ -416,6 +430,9 @@ class LARS(optim.Optimizer):
         for g in self.param_groups:
             for p in g['params']:
                 dp = p.grad
+
+                if dp is None:
+                    continue
 
                 if g['weight_decay_filter'] is None or not g['weight_decay_filter'](p):
                     dp = dp.add(p, alpha=g['weight_decay'])
