@@ -1,4 +1,5 @@
 from pathlib import Path
+import math
 import argparse
 import unittest
 import pickle
@@ -22,6 +23,7 @@ from byol.utils import networks
 from byol.utils import dataset
 from byol.utils import optimizers
 from byol.utils import dataset
+from byol.utils import schedules
 from byol.configs import byol as byol_config
 import byol.byol_experiment
 import byol.jzb_resnet
@@ -39,19 +41,24 @@ def main(args):
         batch_dims=[args.batch_size])
     tr = acme_utils.prefetch(tr)
 
+    rng = random.PRNGKey(0)
+    model = ByolModule().cuda()
+    optimizer = LARS(model.parameters(), learning_rate=None)
+
     # print('initialize BYOL model from JAX')
     # experiment = byol.byol_experiment.ByolExperiment(**config)
-    # rng = random.PRNGKey(0)
     # state = experiment._make_initial_state(rng, next(tr))
     # sd = j2p_sd(j2p_byol_module(state))
     # torch.save(sd, args.tmp_dir / 'init_byol.pth')
+    model.load_state_dict(torch.load(args.tmp_dir / 'init_byol.pth', map_location='cpu'))
 
-    model = ByolModule().cuda()
-    sd = torch.load(args.tmp_dir / 'init_byol.pth', map_location='cpu')
-    model.load_state_dict(sd)
+    for step in range(config['max_steps']):
+        inputs = next(tr)
+        step_rng, rng = jax.random.split(rng)
 
-    for step in range(2):
-        x = next(tr)
+        loss, logs = model.forward(inputs, step_rng)
+
+        print(step_rng)
         exit()
     
 class TestBYOL(unittest.TestCase):
@@ -336,6 +343,19 @@ class TestBYOL(unittest.TestCase):
             updates, jstate = jt.update(grads, jstate, params)
             params = optax.apply_updates(params, updates)
             assert allclose(params, p2j_linear(m, 'linear'))
+
+    def test_cosine_decay(self):
+        self.assertAlmostEqual(schedules._cosine_decay(jnp.array([3]), 10, 2)[0], cosine_decay(3, 10, 2))
+        self.assertAlmostEqual(schedules._cosine_decay(jnp.array([30]), 10, 2)[0], cosine_decay(30, 10, 2))
+        self.assertAlmostEqual(schedules._cosine_decay(jnp.array([0]), 10, 2)[0], cosine_decay(0, 10, 2))
+        self.assertAlmostEqual(schedules._cosine_decay(jnp.array([10]), 100, 4)[0], cosine_decay(10, 100, 4))
+
+
+
+def cosine_decay(global_step, max_steps, initial_value):
+    global_step = min(global_step, max_steps)
+    cosine_decay_value = 0.5 * (1 + math.cos(math.pi * global_step / max_steps))
+    return initial_value * cosine_decay_value
 
 def j2p_tensor(x):
     y = torch.from_numpy(np.asarray(x).copy())
