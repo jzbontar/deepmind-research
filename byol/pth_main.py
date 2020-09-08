@@ -21,27 +21,10 @@ from byol.utils import optimizers
 import byol.byol_experiment
 import byol.jzb_resnet
 
-def j2p_tensor(x):
-    y = torch.from_numpy(np.asarray(x).copy())
-    if y.dtype == torch.int32:
-        y = y.long()
-    if y.ndim == 4:
-        y = y.permute(0, 3, 1, 2)
-    y = y.cuda()
-    return y
+FLAGS = {'random_seed': 0, 'num_classes': 10, 'batch_size': 256, 'max_steps': 36988, 'enable_double_transpose': True, 'base_target_ema': 0.996, 'network_config': {'projector_hidden_size': 4096, 'projector_output_size': 256, 'predictor_hidden_size': 4096, 'encoder_class': 'ResNet18', 'encoder_config': {'resnet_v2': False, 'width_multiplier': 1}, 'bn_config': {'decay_rate': 0.9, 'eps': 1e-05, 'create_scale': True, 'create_offset': True}}, 'optimizer_config': {'weight_decay': 1e-06, 'eta': 0.001, 'momentum': 0.9}, 'lr_schedule_config': {'base_learning_rate': 2.0, 'warmup_steps': 369}, 'evaluation_config': {'subset': 'test', 'batch_size': 25}, 'checkpointing_config': {'use_checkpointing': True, 'checkpoint_dir': '/scratch/jzb/byol_checkpoints', 'save_checkpoint_interval': 300, 'filename': 'pretrain.pkl'}}
 
-def allclose(jx, tx, **kwargs):
-    if isinstance(tx, dict):
-        assert jx.keys() == tx.keys()
-        return all(allclose(jx[k], tx[k]) for k in jx.keys())
-    if isinstance(jx, jnp.ndarray):
-        jx = j2p_tensor(jx)
-    if isinstance(tx, jnp.ndarray):
-        tx = j2p_tensor(tx)
-    close = torch.allclose(jx, tx, **kwargs)
-    if not close:
-        print((jx - tx).abs().max())
-    return close
+def main():
+    pass
 
 class TestBYOL(unittest.TestCase):
     def test_linear(self):
@@ -218,8 +201,7 @@ class TestBYOL(unittest.TestCase):
             view2=random.normal(k2, (2, 128, 128, 3)),
             labels=random.randint(k3, (2,), 0, 9))
 
-        kwargs = {'random_seed': 0, 'num_classes': 10, 'batch_size': 256, 'max_steps': 36988, 'enable_double_transpose': True, 'base_target_ema': 0.996, 'network_config': {'projector_hidden_size': 4096, 'projector_output_size': 256, 'predictor_hidden_size': 4096, 'encoder_class': 'ResNet18', 'encoder_config': {'resnet_v2': False, 'width_multiplier': 1}, 'bn_config': {'decay_rate': 0.9, 'eps': 1e-05, 'create_scale': True, 'create_offset': True}}, 'optimizer_config': {'weight_decay': 1e-06, 'eta': 0.001, 'momentum': 0.9}, 'lr_schedule_config': {'base_learning_rate': 2.0, 'warmup_steps': 369}, 'evaluation_config': {'subset': 'test', 'batch_size': 25}, 'checkpointing_config': {'use_checkpointing': True, 'checkpoint_dir': '/scratch/jzb/byol_checkpoints', 'save_checkpoint_interval': 300, 'filename': 'pretrain.pkl'}}
-        exp = byol.byol_experiment.ByolExperiment(**kwargs)
+        exp = byol.byol_experiment.ByolExperiment(**FLAGS)
         params, state = exp.forward.init(k0, input, is_training=True)
         jout, _ = exp.forward.apply(params, state, input, is_training=True)
         # pickle.dump((params, state), open('foo.pkl', 'wb'))
@@ -245,8 +227,7 @@ class TestBYOL(unittest.TestCase):
             view2=random.normal(k2, (batch_size, 128, 128, 3)),
             labels=random.randint(k3, (batch_size,), 0, 9))
 
-        kwargs = {'random_seed': 0, 'num_classes': 10, 'batch_size': batch_size, 'max_steps': 36988, 'enable_double_transpose': True, 'base_target_ema': 0.996, 'network_config': {'projector_hidden_size': 4096, 'projector_output_size': 256, 'predictor_hidden_size': 4096, 'encoder_class': 'ResNet18', 'encoder_config': {'resnet_v2': False, 'width_multiplier': 1}, 'bn_config': {'decay_rate': 0.9, 'eps': 1e-05, 'create_scale': True, 'create_offset': True}}, 'optimizer_config': {'weight_decay': 1e-06, 'eta': 0.001, 'momentum': 0.9}, 'lr_schedule_config': {'base_learning_rate': 2.0, 'warmup_steps': 369}, 'evaluation_config': {'subset': 'test', 'batch_size': 25}, 'checkpointing_config': {'use_checkpointing': True, 'checkpoint_dir': '/scratch/jzb/byol_checkpoints', 'save_checkpoint_interval': 300, 'filename': 'pretrain.pkl'}}
-        exp = byol.byol_experiment.ByolExperiment(**kwargs)
+        exp = byol.byol_experiment.ByolExperiment(**FLAGS)
         state = exp._make_initial_state(k0, input)
         jout = exp.loss_fn(rng=k0, inputs=input, 
             online_params=state.online_params, 
@@ -325,6 +306,28 @@ class TestBYOL(unittest.TestCase):
             updates, jstate = jt.update(grads, jstate, params)
             params = optax.apply_updates(params, updates)
             assert allclose(params, p2j_linear(m, 'linear'))
+
+def j2p_tensor(x):
+    y = torch.from_numpy(np.asarray(x).copy())
+    if y.dtype == torch.int32:
+        y = y.long()
+    if y.ndim == 4:
+        y = y.permute(0, 3, 1, 2)
+    y = y.cuda()
+    return y
+
+def allclose(jx, tx, **kwargs):
+    if isinstance(tx, dict):
+        assert jx.keys() == tx.keys()
+        return all(allclose(jx[k], tx[k]) for k in jx.keys())
+    if isinstance(jx, jnp.ndarray):
+        jx = j2p_tensor(jx)
+    if isinstance(tx, jnp.ndarray):
+        tx = j2p_tensor(tx)
+    close = torch.allclose(jx, tx, **kwargs)
+    if not close:
+        print((jx - tx).abs().max())
+    return close
 
 
 class LARS(optim.Optimizer):
@@ -628,3 +631,5 @@ def MLP(input_size, hidden_size, output_size):
         nn.ReLU(),
         nn.Linear(hidden_size, output_size, bias=False))
 
+if __name__ == '__main__':
+    main()
