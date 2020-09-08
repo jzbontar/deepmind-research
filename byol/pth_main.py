@@ -73,7 +73,7 @@ def main(args):
     config = byol_config.get_config(args.pretrain_epochs, args.batch_size)
     torch.backends.cudnn.benchmark = True
 
-    tr = datasets.ImageFolder(args.data_dir,
+    tr = datasets.ImageFolder(args.data_dir / 'train',
         TwoCropsTransform(transforms.Compose([
             transforms.RandomResizedCrop(128, interpolation=Image.BICUBIC),
             ToHWCTensor(),
