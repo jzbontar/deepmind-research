@@ -357,6 +357,17 @@ class TestBYOL(unittest.TestCase):
             tout = schedules.learning_schedule(jnp.array([step]), **config)[0]
             self.assertAlmostEqual(tout, jout, places=4)
 
+    def test_target_ema(self):
+        config = dict(base_ema=0.9, max_steps=20)
+        for step in range(config['max_steps']):
+            jout = target_ema(step, **config)
+            tout = schedules.target_ema(jnp.array([step]), **config)[0]
+            self.assertAlmostEqual(tout, jout, places=6)
+
+def target_ema(global_step, base_ema, max_steps):
+    decay = cosine_decay(global_step, max_steps, 1.)
+    return 1. - (1. - base_ema) * decay
+
 def learning_schedule(global_step, batch_size, base_learning_rate, total_steps, warmup_steps):
     scaled_lr = base_learning_rate * batch_size / 256.
     learning_rate = global_step / warmup_steps * scaled_lr if warmup_steps > 0 else scaled_lr
