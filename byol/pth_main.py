@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn, optim
 import torchvision
+from torchvision import datasets, transforms
 
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.20'
 from acme.jax import utils as acme_utils
@@ -22,6 +23,7 @@ import optax
 import dill
 
 import numpy as np
+from PIL import Image
 
 from byol.utils import augmentations
 from byol.utils import networks
@@ -39,12 +41,49 @@ def update_target(model, tau):
     for tp, op in zip(model.target.parameters(), model.online.parameters()):
         tp.mul_(tau).add_(op, alpha=1 - tau)
 
+class TwoCropsTransform:
+    def __init__(self, base_transform):
+        self.base_transform = base_transform
+
+    def __call__(self, x):
+        view1 = self.base_transform(x)
+        view2 = self.base_transform(x)
+        return view1, view2
+
+class ToHWCTensor:
+    def __call__(self, pic):
+        assert isinstance(pic, Image.Image)
+        if pic.mode == 'I':
+            img = torch.from_numpy(np.array(pic, np.int32, copy=False))
+        elif pic.mode == 'I;16':
+            img = torch.from_numpy(np.array(pic, np.int16, copy=False))
+        elif pic.mode == 'F':
+            img = torch.from_numpy(np.array(pic, np.float32, copy=False))
+        elif pic.mode == '1':
+            img = 255 * torch.from_numpy(np.array(pic, np.uint8, copy=False))
+        else:
+            img = torch.ByteTensor(torch.ByteStorage.from_buffer(pic.tobytes()))
+        img = img.view(pic.size[1], pic.size[0], len(pic.getbands()))
+        if isinstance(img, torch.ByteTensor):
+            return img.float().div(255)
+        else:
+            return img
+
 def main(args):
     config = byol_config.get_config(args.pretrain_epochs, args.batch_size)
     torch.backends.cudnn.benchmark = True
 
-    tr = dataset.load(dataset.Split.TRAIN_AND_VALID, preprocess_mode=dataset.PreprocessMode.PRETRAIN, transpose=False, batch_dims=[args.batch_size])
-    tr = acme_utils.prefetch(tr)
+    tr = datasets.ImageFolder(args.data_dir,
+        TwoCropsTransform(transforms.Compose([
+            transforms.RandomResizedCrop(128, interpolation=Image.BICUBIC),
+            ToHWCTensor(),
+        ])))
+    tr_loader = torch.utils.data.DataLoader(tr, shuffle=True, batch_size=args.batch_size, num_workers=args.num_workers)
+
+    def make_inputs(inputs):
+        (view1, view2), labels = inputs
+        return dict(view1=view1.numpy(), view2=view2.numpy(), labels=labels.numpy())
+
     model = ByolModel().cuda()
     optimizer = LARS(model.parameters(), learning_rate=None)
     rng = random.PRNGKey(0)
@@ -68,36 +107,39 @@ def main(args):
     model.load_state_dict(torch.load(args.tmp_dir / 'byol_init.pth', map_location='cpu'))
 
     start_time = last_logging = time.time()
-    for step in range(config['max_steps']):
-        lr = learning_schedule(global_step=step, batch_size=args.batch_size, total_steps=config['max_steps'], **config['lr_schedule_config'])
-        for g in optimizer.param_groups:
-            g['learning_rate'] = lr
 
-        step_rng, rng = jax.random.split(rng)
-        inputs = next(tr)
-        loss, logs = model.forward(inputs, step_rng)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    step = 0
+    for epoch in range(args.pretrain_epochs):
+        for inputs in tr_loader:
+            lr = learning_schedule(global_step=step, batch_size=args.batch_size, total_steps=config['max_steps'], **config['lr_schedule_config'])
+            for g in optimizer.param_groups:
+                g['learning_rate'] = lr
 
-        tau = target_ema(global_step=step, base_ema=config['base_target_ema'], max_steps=config['max_steps'])
-        update_target(model, tau)
+            step_rng, rng = jax.random.split(rng)
+            loss, logs = model.forward(make_inputs(inputs), step_rng)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        current_time = time.time()
-        if current_time - last_logging > args.log_tensors_interval:
-            state = dict(
-                step=step, 
-                classif_loss=logs['classif_loss'].item(),
-                learning_rate=lr, 
-                loss=loss.item(), 
-                repr_loss=logs['repr_loss'].item(),
-                tau=tau, 
-                top1_accuracy=logs['top1_accuracy'].item(), 
-                top5_accuracy=logs['top5_accuracy'].item(), 
-                time=int(current_time - start_time),
-            )
-            print(json.dumps(state))
-            last_logging = current_time
+            tau = target_ema(global_step=step, base_ema=config['base_target_ema'], max_steps=config['max_steps'])
+            update_target(model, tau)
+
+            current_time = time.time()
+            if current_time - last_logging > args.log_tensors_interval:
+                state = dict(
+                    step=step, 
+                    classif_loss=logs['classif_loss'].item(),
+                    learning_rate=lr, 
+                    loss=loss.item(), 
+                    repr_loss=logs['repr_loss'].item(),
+                    tau=tau, 
+                    top1_accuracy=logs['top1_accuracy'].item(), 
+                    top5_accuracy=logs['top5_accuracy'].item(), 
+                    time=int(current_time - start_time),
+                )
+                print(json.dumps(state))
+                last_logging = current_time
+            step += 1
     torch.save(model.state_dict(), args.tmp_dir / f'byol_model_{int(time.time())}.pth')
     
 class TestBYOL(unittest.TestCase):
@@ -759,10 +801,12 @@ def MLP(input_size, hidden_size, output_size):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch-size', type=int, default=4096)
+    parser.add_argument('--num-workers', type=int, default=1)
     parser.add_argument('--pretrain-epochs', type=int, default=1000)
     parser.add_argument('--log-tensors-interval', type=int, default=60)
     parser.add_argument('--convert-to-jax', type=Path)
     parser.add_argument('--tmp-dir', type=Path, default='/checkpoint/jzb/tmp')
+    parser.add_argument('--data-dir', type=Path, default='/checkpoint/jzb/imagenette2-160')
     args = parser.parse_args()
 
     main(args)
