@@ -1,14 +1,18 @@
 from pathlib import Path
+import os
 import math
 import argparse
 import unittest
 import pickle
+import time
+import json
 
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
 import torchvision
 
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.20'
 from acme.jax import utils as acme_utils
 import jax
 import haiku as hk
@@ -54,9 +58,10 @@ def main(args):
     # experiment = byol.byol_experiment.ByolExperiment(**config)
     # state = experiment._make_initial_state(rng, next(tr))
     # sd = j2p_sd(j2p_byol_module(state))
-    # torch.save(sd, args.tmp_dir / 'init_byol.pth')
-    model.load_state_dict(torch.load(args.tmp_dir / 'init_byol.pth', map_location='cpu'))
+    # torch.save(sd, args.tmp_dir / 'byol_init.pth')
+    model.load_state_dict(torch.load(args.tmp_dir / 'byol_init.pth', map_location='cpu'))
 
+    start_time = last_logging = time.time()
     for step in range(config['max_steps']):
         lr = learning_schedule(global_step=step, batch_size=args.batch_size, total_steps=config['max_steps'], **config['lr_schedule_config'])
         for g in optimizer.param_groups:
@@ -72,8 +77,22 @@ def main(args):
         tau = target_ema(global_step=step, base_ema=config['base_target_ema'], max_steps=config['max_steps'])
         update_target(model, tau)
 
-        state = dict(step=step, loss=loss.item(), lr=lr, tau=tau)
-        print(state)
+        current_time = time.time()
+        if current_time - last_logging > args.log_tensors_interval:
+            state = dict(
+                step=step, 
+                classif_loss=logs['classif_loss'].item(),
+                learning_rate=lr, 
+                loss=loss.item(), 
+                repr_loss=logs['repr_loss'].item(),
+                tau=tau, 
+                top1_accuracy=logs['top1_accuracy'].item(), 
+                top5_accuracy=logs['top5_accuracy'].item(), 
+                time=int(current_time - start_time),
+            )
+            print(json.dumps(state))
+            last_logging = current_time
+    torch.save(model.state_dict(), args.tmp_dir / f'byol_model_{int(time.time())}.pth')
     
 class TestBYOL(unittest.TestCase):
     FLAGS = {'random_seed': 0, 'num_classes': 10, 'batch_size': 256, 'max_steps': 36988, 'enable_double_transpose': True, 'base_target_ema': 0.996, 'network_config': {'projector_hidden_size': 4096, 'projector_output_size': 256, 'predictor_hidden_size': 4096, 'encoder_class': 'ResNet18', 'encoder_config': {'resnet_v2': False, 'width_multiplier': 1}, 'bn_config': {'decay_rate': 0.9, 'eps': 1e-05, 'create_scale': True, 'create_offset': True}}, 'optimizer_config': {'weight_decay': 1e-06, 'eta': 0.001, 'momentum': 0.9}, 'lr_schedule_config': {'base_learning_rate': 2.0, 'warmup_steps': 369}, 'evaluation_config': {'subset': 'test', 'batch_size': 25}, 'checkpointing_config': {'use_checkpointing': True, 'checkpoint_dir': '/scratch/jzb/byol_checkpoints', 'save_checkpoint_interval': 300, 'filename': 'pretrain.pkl'}}
@@ -728,6 +747,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch-size', type=int, default=4096)
     parser.add_argument('--pretrain-epochs', type=int, default=1000)
+    parser.add_argument('--log-tensors-interval', type=int, default=60)
     parser.add_argument('--tmp-dir', type=Path, default='/checkpoint/jzb/tmp')
     args = parser.parse_args()
 
