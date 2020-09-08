@@ -1,3 +1,5 @@
+from pathlib import Path
+import argparse
 import unittest
 import pickle
 
@@ -6,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn, optim
 import torchvision
 
+from acme.jax import utils as acme_utils
 import jax
 import haiku as hk
 from jax import random
@@ -18,15 +21,42 @@ from byol.utils import augmentations
 from byol.utils import networks
 from byol.utils import dataset
 from byol.utils import optimizers
+from byol.utils import dataset
+from byol.configs import byol as byol_config
 import byol.byol_experiment
 import byol.jzb_resnet
 
-FLAGS = {'random_seed': 0, 'num_classes': 10, 'batch_size': 256, 'max_steps': 36988, 'enable_double_transpose': True, 'base_target_ema': 0.996, 'network_config': {'projector_hidden_size': 4096, 'projector_output_size': 256, 'predictor_hidden_size': 4096, 'encoder_class': 'ResNet18', 'encoder_config': {'resnet_v2': False, 'width_multiplier': 1}, 'bn_config': {'decay_rate': 0.9, 'eps': 1e-05, 'create_scale': True, 'create_offset': True}}, 'optimizer_config': {'weight_decay': 1e-06, 'eta': 0.001, 'momentum': 0.9}, 'lr_schedule_config': {'base_learning_rate': 2.0, 'warmup_steps': 369}, 'evaluation_config': {'subset': 'test', 'batch_size': 25}, 'checkpointing_config': {'use_checkpointing': True, 'checkpoint_dir': '/scratch/jzb/byol_checkpoints', 'save_checkpoint_interval': 300, 'filename': 'pretrain.pkl'}}
+def main(args):
+    config = byol_config.get_config(args.pretrain_epochs, args.batch_size)
+    del config['network_config']['bn_config']['cross_replica_axis']
 
-def main():
-    pass
+    torch.backends.cudnn.benchmark = True
 
+    tr = dataset.load(
+        dataset.Split.TRAIN_AND_VALID,
+        preprocess_mode=dataset.PreprocessMode.PRETRAIN,
+        transpose=False,
+        batch_dims=[args.batch_size])
+    tr = acme_utils.prefetch(tr)
+
+    # print('initialize BYOL model from JAX')
+    # experiment = byol.byol_experiment.ByolExperiment(**config)
+    # rng = random.PRNGKey(0)
+    # state = experiment._make_initial_state(rng, next(tr))
+    # sd = j2p_sd(j2p_byol_module(state))
+    # torch.save(sd, args.tmp_dir / 'init_byol.pth')
+
+    model = ByolModule().cuda()
+    sd = torch.load(args.tmp_dir / 'init_byol.pth', map_location='cpu')
+    model.load_state_dict(sd)
+
+    for step in range(2):
+        x = next(tr)
+        exit()
+    
 class TestBYOL(unittest.TestCase):
+    FLAGS = {'random_seed': 0, 'num_classes': 10, 'batch_size': 256, 'max_steps': 36988, 'enable_double_transpose': True, 'base_target_ema': 0.996, 'network_config': {'projector_hidden_size': 4096, 'projector_output_size': 256, 'predictor_hidden_size': 4096, 'encoder_class': 'ResNet18', 'encoder_config': {'resnet_v2': False, 'width_multiplier': 1}, 'bn_config': {'decay_rate': 0.9, 'eps': 1e-05, 'create_scale': True, 'create_offset': True}}, 'optimizer_config': {'weight_decay': 1e-06, 'eta': 0.001, 'momentum': 0.9}, 'lr_schedule_config': {'base_learning_rate': 2.0, 'warmup_steps': 369}, 'evaluation_config': {'subset': 'test', 'batch_size': 25}, 'checkpointing_config': {'use_checkpointing': True, 'checkpoint_dir': '/scratch/jzb/byol_checkpoints', 'save_checkpoint_interval': 300, 'filename': 'pretrain.pkl'}}
+
     def test_linear(self):
         def _forward(inputs):
             return hk.Linear(output_size=4, with_bias=True)(inputs)
@@ -201,7 +231,7 @@ class TestBYOL(unittest.TestCase):
             view2=random.normal(k2, (2, 128, 128, 3)),
             labels=random.randint(k3, (2,), 0, 9))
 
-        exp = byol.byol_experiment.ByolExperiment(**FLAGS)
+        exp = byol.byol_experiment.ByolExperiment(**TestBYOL.FLAGS)
         params, state = exp.forward.init(k0, input, is_training=True)
         jout, _ = exp.forward.apply(params, state, input, is_training=True)
         # pickle.dump((params, state), open('foo.pkl', 'wb'))
@@ -227,7 +257,7 @@ class TestBYOL(unittest.TestCase):
             view2=random.normal(k2, (batch_size, 128, 128, 3)),
             labels=random.randint(k3, (batch_size,), 0, 9))
 
-        exp = byol.byol_experiment.ByolExperiment(**FLAGS)
+        exp = byol.byol_experiment.ByolExperiment(**TestBYOL.FLAGS)
         state = exp._make_initial_state(k0, input)
         jout = exp.loss_fn(rng=k0, inputs=input, 
             online_params=state.online_params, 
@@ -368,7 +398,7 @@ def exclude_bias_and_norm(p):
     return p.ndim == 1
 
 def j2p_batchnorm(prefix, params, state):
-    assert state[f'{prefix}/~/var_ema']['counter'] == 0
+    # assert state[f'{prefix}/~/var_ema']['counter'] == 0
     return dict(
         weight=params[prefix]['scale'].ravel(), 
         bias=params[prefix]['offset'].ravel(), 
@@ -632,4 +662,10 @@ def MLP(input_size, hidden_size, output_size):
         nn.Linear(hidden_size, output_size, bias=False))
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--batch-size', type=int, default=4096)
+    parser.add_argument('--pretrain-epochs', type=int, default=1000)
+    parser.add_argument('--tmp-dir', type=Path, default='/checkpoint/jzb/tmp')
+    args = parser.parse_args()
+
+    main(args)
