@@ -70,7 +70,7 @@ def main_worker(gpu, ngpus_per_node, args):
             args.rank = gpu
             args.world_size = ngpus_per_node
             dist_url = 'tcp://127.0.0.1:58473'
-        elif self.distributed == 'multi_node':
+        elif args.distributed == 'multi_node':
             args.rank = gpu + int(os.getenv('SLURM_NODEID')) * ngpus_per_node
             args.world_size = int(os.getenv('SLURM_NNODES')) * ngpus_per_node
             cmd = ['scontrol', 'show', 'hostnames', os.getenv('SLURM_JOB_NODELIST')]
