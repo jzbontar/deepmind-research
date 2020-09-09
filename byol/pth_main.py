@@ -103,7 +103,7 @@ def main_worker(gpu, ngpus_per_node, args):
         (view1, view2), labels = inputs
         return dict(view1=view1.numpy(), view2=view2.numpy(), labels=labels.numpy())
 
-    model_1gpu = model = ByolModel().cuda(args.gpu)
+    model_1gpu = model = ByolModel(gpu=args.gpu).cuda(args.gpu)
     if False:
         print('initialize BYOL model from JAX')
         del config['network_config']['bn_config']['cross_replica_axis']
@@ -141,10 +141,10 @@ def main_worker(gpu, ngpus_per_node, args):
             optimizer.step()
 
             tau = target_ema(global_step=step, base_ema=config['base_target_ema'], max_steps=config['max_steps'])
-            update_target(model, tau)
+            model_1gpu.update_target(tau)
 
             current_time = time.time()
-            if current_time - last_logging > args.log_tensors_interval:
+            if args.rank == 0 and current_time - last_logging > args.log_tensors_interval:
                 stats = dict(
                     epoch=epoch,
                     step=step, 
@@ -163,7 +163,7 @@ def main_worker(gpu, ngpus_per_node, args):
         checkpoint(args, epoch + 1, step, model_1gpu, optimizer)
 
 def checkpoint(args, epoch, step, model, optimizer):
-    if epoch % args.checkpoint_freq != 0:
+    if args.rank != 0 or epoch % args.checkpoint_freq != 0:
         return
 
     # pytorch checkpoint
@@ -175,11 +175,6 @@ def checkpoint(args, epoch, step, model, optimizer):
     byol_state = jax.tree_map(lambda x: jax.device_get(x), byol_state)
     state = dict(experiment_state=byol_state, step=step, rng=random.PRNGKey(0))
     dill.dump(state, open(args.save_dir / 'pretrain.pkl', 'wb'), protocol=2)
-
-@torch.no_grad()
-def update_target(model, tau):
-    for tp, op in zip(model.target.parameters(), model.online.parameters()):
-        tp.mul_(tau).add_(op, alpha=1 - tau)
 
 class TwoCropsTransform:
     def __init__(self, base_transform):
@@ -681,15 +676,19 @@ def accuracy(output, target, topk=(1,)):
         return res
 
 class ByolModel(nn.Module):
-    postprocess_jit = jax.jit(augmentations.postprocess)
-
-    def __init__(self):
+    def __init__(self, gpu=0):
         super().__init__()
         self.online = ByolNetwork()
         self.target = ByolNetwork()
+        self.postprocess_jit = jax.jit(augmentations.postprocess, device=jax.devices()[gpu])
+
+    @torch.no_grad()
+    def update_target(self, tau):
+        for tp, op in zip(self.target.parameters(), self.online.parameters()):
+            tp.mul_(tau).add_(op, alpha=1 - tau)
 
     def forward(self, inputs, rng):
-        inputs = ByolModel.postprocess_jit(inputs, rng)
+        inputs = self.postprocess_jit(inputs, rng)
         inputs = {k: j2p_tensor(v) for k, v in inputs.items()}
         labels = inputs['labels']
 
