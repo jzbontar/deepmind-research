@@ -106,6 +106,11 @@ def main_worker(gpu, ngpus_per_node, args):
         (view1, view2), labels = inputs
         return dict(view1=view1.numpy(), view2=view2.numpy(), labels=labels.numpy())
 
+    if args.rank == 0:
+        print(f'{args.world_size=}')
+        print(f'{len(tr)=}')
+        print(f'{per_device_batch_size=}')
+
     model_1gpu = model = ByolModel(gpu=args.gpu).cuda(args.gpu)
     if False:
         print('initialize BYOL model from JAX')
