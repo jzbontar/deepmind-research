@@ -51,12 +51,6 @@ def main():
     parser.add_argument('--save-dir', type=Path, default='/checkpoint/jzb/tmp')
     parser.add_argument('--distributed', choices=(None, 'single_node', 'multi_node'))
     args = parser.parse_args()
-    print(' '.join(sys.argv))
-
-    dir = os.getcwd().split('/')[-1]
-    cmd = re.sub('[^-.a-zA-Z0-9_]+', '_', '_'.join(sys.argv))
-    args.save_dir = args.save_dir / f'{dir}_{cmd}'
-    args.save_dir.mkdir(parents=True, exist_ok=True)
 
     signal.signal(signal.SIGUSR1, handle_sigusr1)
     signal.signal(signal.SIGTERM, handle_sigterm)
@@ -85,6 +79,16 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         args.rank = 0
         args.world_size = 1
+
+    if args.rank == 0:
+        dir = os.getcwd().split('/')[-1]
+        cmd = re.sub('[^-.a-zA-Z0-9_]+', '_', '_'.join(sys.argv))
+        args.save_dir = args.save_dir / f'{dir}_{cmd}'
+        args.save_dir.mkdir(parents=True, exist_ok=True)
+        stats_file = open(args.save_dir / 'stats.txt', 'a', buffering=1)
+        print(' '.join([dir] + sys.argv))
+        print(' '.join([dir] + sys.argv), file=stats_file)
+
     torch.backends.cudnn.benchmark = True
 
     config = byol_config.get_config(args.pretrain_epochs, args.batch_size)
@@ -154,6 +158,7 @@ def main_worker(gpu, ngpus_per_node, args):
                     time=int(current_time - start_time),
                 )
                 print(json.dumps(stats))
+                print(json.dumps(stats), file=stats_file)
                 last_logging = current_time
         checkpoint(args, epoch + 1, step, model_1gpu, optimizer)
 
