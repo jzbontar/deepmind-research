@@ -680,6 +680,8 @@ class ByolModel(nn.Module):
         super().__init__()
         self.online = ByolNetwork()
         self.target = ByolNetwork()
+        for p in self.target.parameters():
+            p.requires_grad = False
         self.postprocess_jit = jax.jit(augmentations.postprocess, device=jax.devices()[gpu])
 
     @torch.no_grad()
