@@ -98,7 +98,9 @@ def main_worker(gpu, ngpus_per_node, args):
             ToHWCTensor(),
         ])))
     tr_sampler = torch.utils.data.distributed.DistributedSampler(tr) if args.distributed else None
-    tr_loader = torch.utils.data.DataLoader(tr, shuffle=tr_sampler is None, sampler=tr_sampler, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=False)
+    assert args.batch_size % args.world_size == 0
+    per_device_batch_size = args.batch_size // args.world_size
+    tr_loader = torch.utils.data.DataLoader(tr, shuffle=tr_sampler is None, sampler=tr_sampler, batch_size=per_device_batch_size, num_workers=args.num_workers, pin_memory=False)
     def make_inputs(inputs):
         (view1, view2), labels = inputs
         return dict(view1=view1.numpy(), view2=view2.numpy(), labels=labels.numpy())
@@ -680,8 +682,7 @@ class ByolModel(nn.Module):
         super().__init__()
         self.online = ByolNetwork()
         self.target = ByolNetwork()
-        for p in self.target.parameters():
-            p.requires_grad = False
+        self.target.requires_grad_(False)
         self.postprocess_jit = jax.jit(augmentations.postprocess, device=jax.devices()[gpu])
 
     @torch.no_grad()
