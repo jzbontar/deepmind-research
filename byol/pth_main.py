@@ -1,11 +1,15 @@
 from pathlib import Path
-import os
-import math
 import argparse
-import unittest
-import pickle
-import time
 import json
+import math
+import os
+import pickle
+import re
+import signal
+import subprocess
+import sys
+import time
+import unittest
 
 import torch
 import torch.nn.functional as F
@@ -35,6 +39,137 @@ from byol.utils import checkpointing
 from byol.configs import byol as byol_config
 import byol.byol_experiment
 import byol.jzb_resnet
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--batch-size', type=int, default=4096)
+    parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--pretrain-epochs', type=int, default=1000)
+    parser.add_argument('--log-tensors-interval', type=int, default=60)
+    parser.add_argument('--checkpoint-freq', type=int, default=1000)
+    parser.add_argument('--data-dir', type=Path, default='/checkpoint/jzb/imagenette2-160')
+    parser.add_argument('--save-dir', type=Path, default='/checkpoint/jzb/tmp')
+    parser.add_argument('--distributed', choices=(None, 'single_node', 'multi_node'))
+    args = parser.parse_args()
+    print(' '.join(sys.argv))
+
+    dir = os.getcwd().split('/')[-1]
+    cmd = re.sub('[^-.a-zA-Z0-9_]+', '_', '_'.join(sys.argv))
+    args.save_dir = args.save_dir / f'{dir}_{cmd}'
+    args.save_dir.mkdir(parents=True, exist_ok=True)
+
+    signal.signal(signal.SIGUSR1, handle_sigusr1)
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
+    if args.distributed:
+        ngpus_per_node = torch.cuda.device_count()
+        torch.multiprocessing.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+    else:
+        main_worker(0, 1, args)
+
+def main_worker(gpu, ngpus_per_node, args):
+    torch.cuda.set_device(gpu)
+    args.gpu = gpu
+    if args.distributed:
+        if args.distributed == 'single_node':
+            args.rank = gpu
+            args.world_size = ngpus_per_node
+            dist_url = 'tcp://127.0.0.1:58473'
+        elif self.distributed == 'multi_node':
+            args.rank = gpu + int(os.getenv('SLURM_NODEID')) * ngpus_per_node
+            args.world_size = int(os.getenv('SLURM_NNODES')) * ngpus_per_node
+            cmd = ['scontrol', 'show', 'hostnames', os.getenv('SLURM_JOB_NODELIST')]
+            host_name = subprocess.check_output(cmd).decode().splitlines()[0]
+            dist_url = f'tcp://{host_name}:58472'
+        torch.distributed.init_process_group(backend='nccl', init_method=dist_url, world_size=args.world_size, rank=args.rank)
+    else:
+        args.rank = 0
+        args.world_size = 1
+    torch.backends.cudnn.benchmark = True
+
+    config = byol_config.get_config(args.pretrain_epochs, args.batch_size)
+    tr = datasets.ImageFolder(args.data_dir / 'train',
+        TwoCropsTransform(transforms.Compose([
+            transforms.RandomResizedCrop(128, interpolation=Image.BICUBIC),
+            ToHWCTensor(),
+        ])))
+    tr_sampler = torch.utils.data.distributed.DistributedSampler(tr) if args.distributed else None
+    tr_loader = torch.utils.data.DataLoader(tr, shuffle=tr_sampler is None, sampler=tr_sampler, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=False)
+    def make_inputs(inputs):
+        (view1, view2), labels = inputs
+        return dict(view1=view1.numpy(), view2=view2.numpy(), labels=labels.numpy())
+
+    model_1gpu = model = ByolModel().cuda(args.gpu)
+    if False:
+        print('initialize BYOL model from JAX')
+        del config['network_config']['bn_config']['cross_replica_axis']
+        experiment = byol.byol_experiment.ByolExperiment(**config)
+        state = experiment._make_initial_state(rng, next(tr))
+        sd = j2p_sd(j2p_byol_module(state))
+        torch.save(sd, 'byol_init.pth')
+    model.load_state_dict(torch.load('byol_init.pth', map_location='cpu'))
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+    optimizer = LARS(model.parameters(), learning_rate=None)
+
+    if (args.save_dir / 'model.pth').is_file():
+        if args.rank == 0:
+            print('resuming from checkpoint')
+        ckpt = torch.load(args.save_dir / 'model.pth', map_location='cpu')
+        start_epoch = ckpt['epoch']
+        model_1gpu.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+    else:
+        start_epoch = 0
+
+    rng = random.PRNGKey(0)
+    start_time = last_logging = time.time()
+    for epoch in range(start_epoch, args.pretrain_epochs):
+        for step, inputs in enumerate(tr_loader, start=epoch * len(tr_loader)):
+            lr = learning_schedule(global_step=step, batch_size=args.batch_size, total_steps=config['max_steps'], **config['lr_schedule_config'])
+            for g in optimizer.param_groups:
+                g['learning_rate'] = lr
+
+            step_rng, rng = jax.random.split(rng)
+            loss, logs = model.forward(make_inputs(inputs), step_rng)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            tau = target_ema(global_step=step, base_ema=config['base_target_ema'], max_steps=config['max_steps'])
+            update_target(model, tau)
+
+            current_time = time.time()
+            if current_time - last_logging > args.log_tensors_interval:
+                stats = dict(
+                    epoch=epoch,
+                    step=step, 
+                    classif_loss=logs['classif_loss'].item(),
+                    learning_rate=lr, 
+                    loss=loss.item(), 
+                    repr_loss=logs['repr_loss'].item(),
+                    tau=tau, 
+                    top1_accuracy=logs['top1_accuracy'].item(), 
+                    top5_accuracy=logs['top5_accuracy'].item(), 
+                    time=int(current_time - start_time),
+                )
+                print(json.dumps(stats))
+                last_logging = current_time
+        checkpoint(args, epoch + 1, step, model_1gpu, optimizer)
+
+def checkpoint(args, epoch, step, model, optimizer):
+    if epoch % args.checkpoint_freq != 0:
+        return
+
+    # pytorch checkpoint
+    state = dict(epoch=epoch, model=model.state_dict(), optimizer=optimizer.state_dict())
+    torch.save(state, args.save_dir / 'model.pth')
+
+    # convert to jax model
+    byol_state = p2j_byol_model(model)
+    byol_state = jax.tree_map(lambda x: jax.device_get(x), byol_state)
+    state = dict(experiment_state=byol_state, step=step, rng=random.PRNGKey(0))
+    dill.dump(state, open(args.save_dir / 'pretrain.pkl', 'wb'), protocol=2)
 
 @torch.no_grad()
 def update_target(model, tau):
@@ -69,78 +204,14 @@ class ToHWCTensor:
         else:
             return img
 
-def main(args):
-    config = byol_config.get_config(args.pretrain_epochs, args.batch_size)
-    torch.backends.cudnn.benchmark = True
+def handle_sigusr1(signum, frame):
+    os.system(f'scontrol requeue {os.environ["SLURM_JOB_ID"]}')
+    exit()
 
-    tr = datasets.ImageFolder(args.data_dir / 'train',
-        TwoCropsTransform(transforms.Compose([
-            transforms.RandomResizedCrop(128, interpolation=Image.BICUBIC),
-            ToHWCTensor(),
-        ])))
-    tr_loader = torch.utils.data.DataLoader(tr, shuffle=True, batch_size=args.batch_size, num_workers=args.num_workers)
+def handle_sigterm(signum, frame):
+    pass
 
-    def make_inputs(inputs):
-        (view1, view2), labels = inputs
-        return dict(view1=view1.numpy(), view2=view2.numpy(), labels=labels.numpy())
-
-    model = ByolModel().cuda()
-    optimizer = LARS(model.parameters(), learning_rate=None)
-    rng = random.PRNGKey(0)
-
-    if args.convert_to_jax:
-        model.load_state_dict(torch.load(args.convert_to_jax, map_location='cpu'))
-        byol_state = p2j_byol_model(model)
-        byol_state = jax.tree_map(lambda x: jax.device_get(x), byol_state)
-        checkpoint_data = dict(experiment_state=byol_state, step=36988, rng=rng)
-        with open(args.tmp_dir / 'pretrain.pkl', 'wb') as checkpoint_file:
-            dill.dump(checkpoint_data, checkpoint_file, protocol=2)
-        exit()
-    
-    if False:
-        print('initialize BYOL model from JAX')
-        del config['network_config']['bn_config']['cross_replica_axis']
-        experiment = byol.byol_experiment.ByolExperiment(**config)
-        state = experiment._make_initial_state(rng, next(tr))
-        sd = j2p_sd(j2p_byol_module(state))
-        torch.save(sd, args.tmp_dir / 'byol_init.pth')
-    model.load_state_dict(torch.load(args.tmp_dir / 'byol_init.pth', map_location='cpu'))
-
-    start_time = last_logging = time.time()
-
-    step = 0
-    for epoch in range(args.pretrain_epochs):
-        for inputs in tr_loader:
-            lr = learning_schedule(global_step=step, batch_size=args.batch_size, total_steps=config['max_steps'], **config['lr_schedule_config'])
-            for g in optimizer.param_groups:
-                g['learning_rate'] = lr
-
-            step_rng, rng = jax.random.split(rng)
-            loss, logs = model.forward(make_inputs(inputs), step_rng)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            tau = target_ema(global_step=step, base_ema=config['base_target_ema'], max_steps=config['max_steps'])
-            update_target(model, tau)
-
-            current_time = time.time()
-            if current_time - last_logging > args.log_tensors_interval:
-                state = dict(
-                    step=step, 
-                    classif_loss=logs['classif_loss'].item(),
-                    learning_rate=lr, 
-                    loss=loss.item(), 
-                    repr_loss=logs['repr_loss'].item(),
-                    tau=tau, 
-                    top1_accuracy=logs['top1_accuracy'].item(), 
-                    top5_accuracy=logs['top5_accuracy'].item(), 
-                    time=int(current_time - start_time),
-                )
-                print(json.dumps(state))
-                last_logging = current_time
-            step += 1
-    torch.save(model.state_dict(), args.tmp_dir / f'byol_model_{int(time.time())}.pth')
+### TEST ####
     
 class TestBYOL(unittest.TestCase):
     FLAGS = {'random_seed': 0, 'num_classes': 10, 'batch_size': 256, 'max_steps': 36988, 'enable_double_transpose': True, 'base_target_ema': 0.996, 'network_config': {'projector_hidden_size': 4096, 'projector_output_size': 256, 'predictor_hidden_size': 4096, 'encoder_class': 'ResNet18', 'encoder_config': {'resnet_v2': False, 'width_multiplier': 1}, 'bn_config': {'decay_rate': 0.9, 'eps': 1e-05, 'create_scale': True, 'create_offset': True}}, 'optimizer_config': {'weight_decay': 1e-06, 'eta': 0.001, 'momentum': 0.9}, 'lr_schedule_config': {'base_learning_rate': 2.0, 'warmup_steps': 369}, 'evaluation_config': {'subset': 'test', 'batch_size': 25}, 'checkpointing_config': {'use_checkpointing': True, 'checkpoint_dir': '/scratch/jzb/byol_checkpoints', 'save_checkpoint_interval': 300, 'filename': 'pretrain.pkl'}}
@@ -799,14 +870,4 @@ def MLP(input_size, hidden_size, output_size):
         nn.Linear(hidden_size, output_size, bias=False))
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--batch-size', type=int, default=4096)
-    parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--pretrain-epochs', type=int, default=1000)
-    parser.add_argument('--log-tensors-interval', type=int, default=60)
-    parser.add_argument('--convert-to-jax', type=Path)
-    parser.add_argument('--tmp-dir', type=Path, default='/checkpoint/jzb/tmp')
-    parser.add_argument('--data-dir', type=Path, default='/checkpoint/jzb/imagenette2-160')
-    args = parser.parse_args()
-
-    main(args)
+    main()
