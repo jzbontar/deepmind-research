@@ -17,7 +17,8 @@ from torch import nn, optim
 import torchvision
 from torchvision import datasets, transforms
 
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.20'
+# os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.20'
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 from acme.jax import utils as acme_utils
 import jax
 import haiku as hk
