@@ -115,6 +115,7 @@ def main_worker(gpu, ngpus_per_node, args):
         torch.save(sd, 'byol_init.pth')
     model.load_state_dict(torch.load('byol_init.pth', map_location='cpu'))
     if args.distributed:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
     optimizer = LARS(model.parameters(), learning_rate=None)
 
